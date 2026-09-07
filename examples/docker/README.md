@@ -20,10 +20,10 @@
 ```bash
 cd examples/docker
 
-# 默认 Ray 2.55.1（推荐，对齐 kuberay 示例）
+# 默认 Ray 2.55.1，与 ../quickstart/ 和 ../kuberay/ 的 rayVersion 一致
 bash build.sh
 
-# 对齐 quickstart 的 Ray 2.46.0
+# 换 Ray 版本时，示例 YAML 的 image tag 和 rayVersion 要同步改
 RAY_VERSION=2.46.0 IMAGE=daft-ray-ops:2.46.0 bash build.sh
 ```
 
@@ -48,41 +48,30 @@ Docker 里有的镜像，k3s containerd **不一定**能用到，需显式导入
 # 导出（在有网机器）
 docker save daft-ray-ops:2.55.1 | gzip > daft-ray-ops-2.55.1.tar.gz
 
-# 在 k3s 节点（如 daftvm）
+# 在 k3s 节点上导入
 gunzip -c daft-ray-ops-2.55.1.tar.gz | sudo k3s ctr -n k8s.io images import -
-# 或本机构建后直接：
+# 本机构建的话直接：
 bash import-to-k3s.sh daft-ray-ops:2.55.1
 ```
 
 ## 在 RayJob 里使用
 
-三处版本对齐（与 quickstart 同理，只是不再靠 PEP 723）：
+两处版本必须对齐，否则 worker 连不上 head：
 
 ```text
-Dockerfile / build.sh     RAY_VERSION=2.55.1
-10-rayjob-baked.yaml      image: daft-ray-ops:2.55.1
-10-rayjob-baked.yaml      rayVersion: "2.55.1"
+build.sh          RAY_VERSION=2.55.1
+10-rayjob.yaml    image: daft-ray-ops:2.55.1  +  rayVersion: "2.55.1"
 ```
 
-**baked 版脚本**（无 `uv`、无 `runtime_env pip`）：
-
-```python
-import daft
-
-daft.set_runner_ray()
-df = daft.from_pydict({"a": [1, 2, 3]})
-print(df.collect())
-```
-
-一键验证（4GB VM 用 smoke 规格）：
+跑一遍 [`../quickstart/`](../quickstart/) 验证：
 
 ```bash
-kubectl apply -f ../quickstart/00-configmap-script-baked.yaml
-kubectl apply -f ../quickstart/10-rayjob-baked-smoke.yaml
-kubectl get rayjob daft-quickstart-baked -n daft-quickstart -w
+kubectl apply -f ../quickstart/00-configmap-script.yaml
+kubectl apply -f ../quickstart/10-rayjob.yaml       # 4GB 虚拟机换 10-rayjob-smoke.yaml
+kubectl get rayjob daft-quickstart -n daft-quickstart -w
 ```
 
-entrypoint 也可直接用镜像内脚本（无需 ConfigMap）：
+镜像里自带 `/opt/daft-handbook/smoke.py`，不想挂 ConfigMap 时可以直接：
 
 ```yaml
 entrypoint: python /opt/daft-handbook/smoke.py
@@ -96,10 +85,9 @@ entrypoint: python /opt/daft-handbook/smoke.py
 2. **不要用 `daft[ray]`** —— 基镜像已有 Ray，extra 会 pip 覆盖
 3. 需要 GPU / CUDA 时换 `rayproject/ray:<ver>-py312-gpu` 基镜像并自行验证 Daft wheel
 
-## 三套镜像怎么选
+## 两套镜像怎么选
 
 | 镜像 | 何时用 |
 | --- | --- |
-| `rayproject/ray:2.46.0-py312-cpu` | 零构建验证 KubeRay 链路（[`../quickstart/`](../quickstart/)） |
 | **`daft-ray-ops:<ray>`**（本目录） | 通用 Daft 流水线，依赖烤进镜像，带运维 CLI |
-| `daft-audio:offline` | 完整音频 ASR benchmark（[`../kuberay/`](../kuberay/)） |
+| `daft-audio:offline` | 完整音频 ASR benchmark，额外含 FunASR 模型与 ffmpeg（[`../kuberay/`](../kuberay/)） |

@@ -1,6 +1,6 @@
-# Daft on Ray 架构
+# 架构
 
-这一章只回答一件事：作业在集群上到底怎么跑。后面所有部署约束、调参顺序和内存判断，都从这里推出来。
+这一页只回答一件事：作业在集群上到底怎么跑。后面所有部署约束、调参顺序和内存判断，都从这里推出来。
 
 ## Flotilla 与 Swordfish
 
@@ -22,9 +22,7 @@ Optimizer     谓词下推、列裁剪、Join 重排、UDF 拆分
 Execution     把物理计划翻译成 pipeline
 ```
 
-最下层的形态是 **pipeline，不是 stage**。算子同时驻留，数据在其间流动，不存在“上一阶段全部物化完再进入下一阶段”。后面所有内存判断都以此为前提。
-
-`select` / `where` / `with_column` 不会立刻跑。触发执行的是 `show`、`collect`、`count_rows`、`to_*` 和 `write_*`。生产作业用写出收尾，不要用 `collect()` 当“强制执行”。
+最下层的形态是 **pipeline，不是 stage**。算子同时驻留，数据在其间流动，不存在"上一阶段全部物化完再进入下一阶段"。后面所有内存判断都以此为前提。
 
 ## Swordfish：morsel 驱动的流式执行
 
@@ -33,18 +31,15 @@ Execution     把物理计划翻译成 pipeline
 ```text
 算子之间是有界 async channel
 下游背压 → channel 满 → 上游阻塞
-morsel 行数是上限（default_morsel_size）
-实际大小随数据波动
-真正按运行时反馈调批是另一个开关：enable_dynamic_batching（默认关）
 ```
 
-峰值内存因此与数据总量脱钩，只取决于**在途 morsel**。
+峰值内存因此与数据总量脱钩，只取决于**在途 morsel**：并发 task × 在途 morsel 数 × 单行实际体积。数据总量翻十倍，只要在途量不变，峰值可以不变。
 
-例外是 **blocking sink**：必须收齐输入才能产出，会在内存里累积状态。这时调小 morsel 无效——先确认 pipeline 里有没有这类算子，再动参数。
-
-`morsel` 配的是**行数，不是字节**。URL 列只有几十字节，下载解码之后可能是几 MB。同一个 morsel 行数在 scan 与 decode 之后可以差三个数量级。
+`morsel` 配的是**行数，不是字节**。URL 列只有几十字节，下载解码之后可能是几 MB。同一个 morsel 行数在 scan 与 decode 之后可以差三个数量级。行批要求怎么在算子之间传播、两个旋钮各自管什么，见 [Morsel 与 into_batches](05-morsel-batch.md)。
 
 ## 算子分两类
+
+这是判断"调小 morsel 有没有用"的依据。
 
 ### Streaming：来一批走一批，内存不随数据量增长
 
@@ -69,9 +64,7 @@ morsel 行数是上限（default_morsel_size）
 | Join | build 侧（构建 probe table） |
 | 写出 | `write`、`commit_write` |
 
-`df.explain()` 里出现第二类，就先问能不能换算法或去掉，再考虑调 morsel。
-
-`maintain_order` 默认 `True`。部分 blocking sink（如 `write_parquet`）会强制关掉它并向下传播。不需要顺序时显式设 `False`，可以省掉排序缓冲。
+`df.explain()` 里出现第二类，状态就会随数据增长，这时调小 morsel 几乎无效——先问能不能换算法、减 key 基数、换 broadcast 或去掉 shuffle，再考虑动参数。
 
 ## WriteSink 累积的是什么
 
@@ -85,7 +78,7 @@ row group 缓冲     parquet_target_row_group_size，默认 128MB（in-memory �
 结果元数据          文件条数 × 每条 stats，最终回到 driver
 ```
 
-写出侧内存高，先看 `partition_cols` 的基数，再看 row group 目标值。不要把 WriteSink 理解成“全表物化后再写”。
+写出侧内存高，先看 `partition_cols` 的基数，再看 row group 目标值。不要把 WriteSink 理解成"全表物化后再写"。参数见[读写参数](07-io-config.md)。
 
 ## Flotilla：task = partition，driver 只持有 metadata
 
@@ -101,7 +94,7 @@ Scheduler 按数据局部性和 worker 负载分配 task。**一个 task 对应�
 1. **partition 数的上限由 driver 决定。** 它管理的 metadata 条数随 partition 增长，与数据体积无关。
 2. **每个节点一个 Swordfish worker，不是一核一个进程。** 一核一个时，单个 worker 拿到一批文件必须下载完才能解析、推理，阶段间串行；一节点一个时，I/O 与计算在 worker 内部重叠。
 
-由此推出：**worker pod 应当少而大**。把 64 核拆成 64 个 1 核 pod，会把流水线切碎，I/O 与计算无法重叠。
+由此推出：**worker pod 应当少而大**。把 64 核拆成 64 个 1 核 pod，会把流水线切碎，I/O 与计算无法重叠。具体规格见[资源与调参](09-tuning-runbook.md)。
 
 ## 失败语义：task 级重算
 
@@ -115,6 +108,8 @@ map-only 链路     已完成 task 通常只回传写出元数据，几乎无中
 partition 数因此同时决定三件事：并行度、单 task 的重量、重算粒度。不要把 checkpoint 当成 exactly-once 或作业续传。
 
 ## 三条部署硬约束
+
+这三条是 KubeRay / Ray / cgroup 三方行为的交集，不是风格选择。
 
 ### 1. head `num-cpus=0`
 
@@ -140,7 +135,7 @@ Ray 调度只读 num-cpus，真正的约束是 cgroup
 共享同一个额度，不可重复扣减
 ```
 
-内存不参与调度决策。Flotilla 按 CPU/GPU 和负载派 task，不判断该节点的内存是否承载得下。余量必须自己留。
+内存**不参与调度决策**。Flotilla 按 CPU/GPU 和负载派 task，不判断该节点的内存是否承载得下。余量必须自己留，预算公式见[资源与调参](09-tuning-runbook.md)。
 
 ## 四个旋钮，各归一层
 
@@ -151,16 +146,12 @@ Ray 调度只读 num-cpus，真正的约束是 cgroup
 | **batch_size** | UDF | 单次推理的样本数 | 模型吞吐不足 | 单批内存峰值上升 |
 | **max_concurrency** | UDF | 常驻实例数 / 协程并发 | 资源利用不足 | OOM、排队、下游限流 |
 
-调参顺序按这个层级从上往下：**partition → morsel → UDF**。入口的 partition 数由读侧参数决定，出口的文件形态由写侧参数决定。
+四个数字相乘才是在途字节。只改其中一个、不看乘积，就会出现"我已经把 morsel 调小了还是 OOM"——因为 actor 数或 `download(max_connections=32)` 把并发乘回去了。
 
-记住：`morsel` 是行数，不是字节。行一旦变“胖”（blob、大字符串、解码后的张量），默认的 131072 行就是灾难。
-
-## 这一章推出来的生产结论
+## 这一页推出来的结论
 
 1. Native 只验证 Swordfish；生产多机必须用 Ray runner。
 2. Worker 少而大，head 不接计算任务。
 3. 数据不经过 client / driver，只经过 worker。
-4. 先定 partition，再压 morsel，最后才调 UDF。
-5. 写出不是全量物化；高基数 `partition_cols` 比 morsel 更容易把写出内存打爆。
-
-下一章把这套架构翻译成四个必须先分清的概念。
+4. 写出不是全量物化；高基数 `partition_cols` 比 morsel 更容易把写出内存打爆。
+5. `explain()` 里有 blocking 算子时，先改算法，再调 morsel。

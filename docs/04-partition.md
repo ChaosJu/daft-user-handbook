@@ -2,16 +2,18 @@
 
 Partition 是 Flotilla 的工作单元：**一个 partition = 一个 task**。它决定并行度、单 task 重量、失败重算粒度和（如果写出前不合并）输出文件数。
 
-它**不是** morsel，也**不是** UDF 的 `batch_size`。只改 task 数解决不了单 task 峰值内存。
+它不解决单 task 峰值内存——那是 [Morsel](05-morsel-batch.md) 的事。
 
-## 三个 API
+## 四个 API
 
 | API | 是否全局 shuffle | 改什么 | Native 上 |
 |---|---|---|---|
 | `into_partitions(N)` | 否，机械拆分 / 合并 | 只改 partition 数，保留上游 clustering | no-op |
 | `repartition(N)` | 是，随机 shuffle | 打散负载，不保证 key 共址 | no-op |
 | `repartition(N, key)` | 是，按 key 哈希 | 相同 key 落到同一 partition | no-op |
-| `into_batches(n)` | 否 | **不改 partition**，只改后续行批 | **有效** |
+| `into_batches(n)` | 否，但**会物化并重切 partition** | 主要改行批；Ray 上顺带把 partition 切成 ~n 行 | **有效**（只改行批，不改 partition） |
+
+`into_batches` 那一行容易踩坑：它在 Native 上纯粹是流内组批，在 Ray 上却是一个 task 边界，会把上游输出物化后重新打包成新 task，并且**作废上游的 clustering**。想控内存用它没问题，但不要指望 `repartition(N, key)` 建立的共址能穿过它。机制见 [Morsel 与 into_batches](05-morsel-batch.md)。
 
 ```python
 # 扫描后只有 3 个 partition，希望 64 路并行 UDF

@@ -1,30 +1,20 @@
 # ============================================================================
-# 官方 Daft 示例脚本（逐字照抄）
+# 示例脚本 —— 依赖已烤进 daft-ray-ops 镜像，运行期不装任何东西
 #
-# 来源：https://docs.daft.ai/en/stable/distributed/kubernetes/
-#       "Running on Kubernetes" → Distributed Mode
+# 逻辑取自官方 Daft K8s 文档的 Distributed Mode 示例：
+#   https://docs.daft.ai/en/stable/distributed/kubernetes/
 #
-# main.py 的内容与官方文档**一字不改**，包括 print(df.collect())。
-# 这是刻意的：这套示例的用途就是"官方怎么写的，在 RayJob 里也照样能跑"。
-# 生产不该这么写，为什么见 README.md 的"三处和生产禁区冲突的地方"。
+# 与官方原文的两处差异，都是刻意的：
 #
-# 三个细节值得看懂，它们决定了 10-rayjob.yaml 为什么能不带自建镜像就跑起来：
+# 1. 去掉了 PEP 723 内联依赖块和 ray.init(runtime_env={"pip": ["daft"]})。
+#    官方靠 `uv run --script` 给 driver 装 daft、靠 runtime_env 给 worker 装，
+#    每次作业都要连 PyPI，离线不可用且 driver/worker 版本没有保证。
+#    这里依赖在镜像里（见 ../docker/），直接 `python main.py` 就行。
 #
-# 1. 开头那个 `# /// script` 块是 PEP 723 内联依赖声明。
-#    `uv run --script main.py` 会读它，临时建一个装好 daft 的 venv。
-#    所以 driver 端的 daft 是运行时装的，镜像里不需要有。
-#    Ray 2.45 起 rayproject/ray 镜像自带 uv，这条路才走得通。
+# 2. 保留了 print(df.collect())。示例只有 6 行，看得见输出才好验证链路；
+#    生产必须以 write_* 收尾，理由见 docs/03-best-practices/production-donts.md。
 #
-# 2. `ray[client]==2.46.0` 必须和镜像里的 Ray 版本一致。
-#    uv 建的 venv 是隔离的，不会复用镜像里的 ray；版本不一致连不上 GCS。
-#    换镜像 tag 就要同步改这里，和 10-rayjob.yaml 的 rayVersion 三处对齐。
-#
-# 3. `ray.init(runtime_env={"pip": ["daft"]})` 负责把 daft 送到 **worker**。
-#    第 1 条只解决 driver。这也是为什么 10-rayjob.yaml 里
-#    **不能**再设 runtimeEnvYAML —— 两处都声明 runtime_env 会冲突。
-#
-# 挂载点是 /home/ray/samples/main.py：rayproject/ray 镜像以 ray 用户
-# （HOME=/home/ray）运行，放在 HOME 下面权限最省事。
+# 挂载点是 /home/ray/samples/main.py：镜像以 ray 用户运行（HOME=/home/ray）。
 # ============================================================================
 apiVersion: v1
 kind: Namespace
@@ -40,14 +30,9 @@ metadata:
     app.kubernetes.io/name: daft-quickstart
 data:
   main.py: |
-    # /// script
-    # dependencies = ["daft", "ray[client]==2.46.0"]
-    # ///
-
     import daft
-    import ray
 
-    ray.init(runtime_env={"pip": ["daft"]})
+    daft.set_runner_ray()
 
     df = daft.from_pydict({
         "a": [3, 2, 5, 6, 1, 4],

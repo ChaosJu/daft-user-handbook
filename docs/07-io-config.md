@@ -41,13 +41,35 @@ daft.context.set_planning_config(
 | `multipart_size` | 8 MB | 写，范围 5MB～5GB |
 | `multipart_max_concurrency` | 100 | 单对象分片并发，过大吃内存 |
 
-**`url.download(max_connections=...)` 默认 32，且会覆盖 `S3Config.max_connections`。** 详见 [Batch](batch.md)。内存爬升时这是最容易被忽略的乘数。
-
 Ray runner 上 `read_parquet(_multithreaded_io=False)` 可减少每 worker 连接与线程争用。不传时 Native 默认 True、Ray 默认 False。
+
+## `download()` 默认 32 会覆盖 S3Config
+
+这是内存排查里最容易被忽略的乘数。
+
+```text
+S3Config.max_connections     默认 8，且是「每 IO 线程」
+url.download(max_connections) 默认 32，且会顶掉上面的 8
+```
+
+```python
+# 错误：不写 max_connections，每个 morsel 仍按 32 路拉对象
+df = df.with_column("bytes", daft.col("url").url.download())
+
+# 正确：显式压到与 S3Config / 内存预算一致
+df = df.into_batches(8).with_column(
+    "bytes",
+    daft.col("url").url.download(max_connections=8),
+)
+```
+
+在途字节 ≈ `min(batch 行数, max_connections)` × 单对象大小。16 行一批、每行 4 MB 图、32 路下载，一个 task 就能同时在途数百 MB，再乘并发 task 数。
+
+对象存储限流、worker 内存爬升、decode 前 working set 陡增时，先把 `download(max_connections)` 从 32 降到 4～8，再动 morsel。压批的位置见 [Morsel 与 into_batches](05-morsel-batch.md)。
 
 ## Parquet 读
 
-`enable_scan_task_split_and_merge` 等属于 execution config，不是 `read_parquet` 的参数。见 [Partition](partition.md)。
+`enable_scan_task_split_and_merge` 等属于 execution config，不是 `read_parquet` 的参数。见 [Partition](04-partition.md)。
 
 | 参数 | 默认 | 说明 |
 |---|---|---|

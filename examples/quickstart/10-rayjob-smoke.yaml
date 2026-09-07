@@ -2,7 +2,12 @@
 # RayJob smoke —— 给 4GB / 2CPU 虚拟机用
 #
 # 镜像：examples/docker/ 构建的 daft-ray-ops:2.55.1（Daft + 运维 CLI 已烤进镜像）
-# daftvm（3.8Gi RAM / 2 CPU）跑正式版 head 2Gi + worker 4Gi 排不下。
+# 相对 10-rayjob.yaml 只缩了资源、放宽了探针与超时，脚本和镜像不变。
+#
+# 三处为小内存节点做的让步，换成大节点时可以去掉：
+#   - object-store-memory 显式设成 75Mi（Ray 的下限，不设会算出更小值直接退出）
+#   - /dev/shm 手动限制（KubeRay 默认按 memory limit 给，会把 head 挤爆）
+#   - readinessProbe 延到 60s，activeDeadlineSeconds 放到 900s
 # ============================================================================
 apiVersion: ray.io/v1
 kind: RayJob
@@ -64,7 +69,7 @@ spec:
           volumes:
             - name: script
               configMap:
-                name: daft-quickstart-baked-script
+                name: daft-quickstart-script
                 items:
                   - { key: main.py, path: main.py }
             - name: ray-logs

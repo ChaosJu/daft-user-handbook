@@ -1,5 +1,5 @@
 # ============================================================================
-# RayJob —— daft-ray-ops 自建镜像 + baked 示例脚本
+# RayJob —— daft-ray-ops 自建镜像，依赖已烤进镜像
 #
 # 和 ../kuberay/20-rayjob.yaml 是同一种形态（RayJob + 临时集群）。
 # 镜像见 ../docker/（Daft + top/ps/netstat 等运维 CLI 已烤进镜像）。
@@ -7,9 +7,9 @@
 # 前置条件：
 #   - KubeRay operator + CRD
 #   - 已构建并导入 daft-ray-ops:2.55.1（见 ../docker/README.md）
-#   - 已 apply 00-configmap-script-baked.yaml
+#   - 已 apply 00-configmap-script.yaml
 #
-# 若需对照官方「运行时装 daft」形态，见 00-configmap-script.yaml + git 历史。
+# 4GB 虚拟机排不下这份规格，用 10-rayjob-smoke.yaml。
 # ============================================================================
 apiVersion: ray.io/v1
 kind: RayJob
@@ -85,7 +85,7 @@ spec:
           volumes:
             - name: script
               configMap:
-                name: daft-quickstart-baked-script
+                name: daft-quickstart-script
                 items:
                   - { key: main.py, path: main.py }
             - name: ray-logs

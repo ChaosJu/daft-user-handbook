@@ -25,23 +25,13 @@ markdown_extensions:
       permalink: true
 nav:
   - 首页: index.md
-  - 1. 架构介绍:
-      - Daft on Ray 架构: 01-architecture/index.md
-  - 2. 基本原理:
-      - 原理总览: 02-principles/index.md
-      - Morsel 驱动的流式执行: 02-principles/morsel.md
-  - 3. 最佳实践:
-      - 实践总览: 03-best-practices/index.md
-      - KubeRay 部署: 03-best-practices/deploy-kuberay.md
-      - RayJob 实战: 03-best-practices/rayjob-hands-on.md
-      - Partition: 03-best-practices/partition.md
-      - Batch 与 Morsel: 03-best-practices/batch.md
-      - UDF: 03-best-practices/udf.md
-      - 读写参数配置: 03-best-practices/io-config.md
-      - 生产禁区: 03-best-practices/production-donts.md
-  - 4. 日志、监控与调参:
-      - 观测总览: 04-observability/index.md
-      - 如何看日志: 04-observability/logs.md
-      - 如何看监控: 04-observability/monitoring.md
-      - 根据监控调参: 04-observability/tune-from-metrics.md
-      - 资源怎么设: 04-observability/resource-sizing.md
+  - 1. 架构: 01-architecture.md
+  - 2. 执行模型: 02-execution-model.md
+  - 3. KubeRay RayJob 部署: 03-deploy-kuberay.md
+  - 4. Partition: 04-partition.md
+  - 5. Morsel 与 into_batches: 05-morsel-batch.md
+  - 6. UDF: 06-udf.md
+  - 7. 读写参数: 07-io-config.md
+  - 8. 日志与监控: 08-observability.md
+  - 9. 资源与调参: 09-tuning-runbook.md
+  - 10. 生产禁区: 10-production-donts.md

@@ -51,7 +51,7 @@ class Embedder:
 |---|---|---|
 | `cpus` / `gpus` | 每实例资源需求 | 只影响放置：8 CPU 机器 + `cpus=4` → 最多 2 个实例 |
 | `max_concurrency` | **同步 = actor 进程数；async = 协程并发数** | 同名两种语义，最容易配错 |
-| `batch_size` | 单批最大行数，仅 batch API | 上限不是保证值，上游 morsel 更小就填不满 |
+| `batch_size` | 单批最大行数，仅 batch API | 上限不是保证值，上游 morsel 更小就填不满，见 [Morsel](05-morsel-batch.md) |
 | `use_process` | 每实例独立进程 | 不设时引擎自选；绕 GIL、隔离 native 崩溃 |
 | `max_retries` | 单次调用（一行或一批）重试次数 | 默认 0；带指数退避。**不是** actor 重启 |
 | `on_error` | `raise` / `log` / `ignore` | `log` / `ignore` 把结果**置 null** |
@@ -98,7 +98,7 @@ DAFT_MAX_ASYNC_UDF_INFLIGHT_TASKS  默认 64
    必须给 I/O、写出、Ray 系统进程留余量，不能把 CPU 排满
 ```
 
-actor 资源大于 worker 资源时，Ray 不会报一个响亮的“配错了”，只会一直 `PENDING`。三十秒体检里 `ray list actors` 就是为这个准备的。
+actor 资源大于 worker 资源时，Ray 不会报一个响亮的“配错了”，只会一直 `PENDING`。[三十秒体检](09-tuning-runbook.md)里 `ray list actors` 就是为这个准备的。
 
 ## 每个 worker 能放几个 actor，由内存决定
 

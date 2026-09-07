@@ -1,13 +1,42 @@
-# RayJob 实战
+# KubeRay RayJob 部署
 
-[上一页](deploy-kuberay.md)讲选型。这一页走一遍改造：把一套"常驻 RayCluster + 外部 submit Job"的真实压测，按官方 [RayJob Quickstart](https://docs.ray.io/en/latest/cluster/kubernetes/getting-started/rayjob-quick-start.html) 的形态重新组织。
+生产批处理只用 **RayJob** 这一条路。可 apply 的规格在 [`examples/kuberay/`](../examples/kuberay/)，本文与清单**一一对应**——文档讲步骤、字段与排障，YAML 是唯一真相来源。
 
-清单在 [`examples/kuberay/`](../../examples/kuberay/)。参数不是示意值：`10 × 2C/10Gi`、`object-store-memory 2Gi`、`/dev/shm 3Gi`、`asr-actor-concurrency 16`、`default_morsel_size 8` 都来自那次压测的实际配置。基线是 KubeRay v1.6.2 + Ray 2.55.1。
+| 你要做什么 | 看哪里 | apply 什么 |
+|---|---|---|
+| 第一次验证 KubeRay 装对了 | [`examples/quickstart/`](../examples/quickstart/) | `10-rayjob-smoke.yaml` |
+| 生产批处理（默认） | 本文 + [`examples/kuberay/`](../examples/kuberay/) | `20-rayjob.yaml` |
+| 连续调参、留现场 | 本文「路径 B」 | `40-raycluster.yaml` + `41-rayjob-existing.yaml` |
+| 定时回归 | 本文「RayCronJob」 | `30-raycronjob.yaml` |
 
-官方中文镜像：<https://docs.rayai.org.cn/en/latest/cluster/kubernetes/getting-started/rayjob-quick-start.html>
+基线：KubeRay v1.6.2、Ray 2.55.1。官方步骤对照：[RayJob Quickstart](https://docs.ray.io/en/latest/cluster/kubernetes/getting-started/rayjob-quick-start.html)。
 
 !!! tip "手上还没有镜像？"
-    先跑 [`examples/quickstart/`](../../examples/quickstart/)：两个文件、官方 `rayproject/ray` 镜像、官方示例脚本，零构建就能确认 KubeRay 和 RayJob 装对了。跑通再回来看这一页。详见本页末尾[官方镜像 + 官方示例](#官方镜像-官方示例)。
+    先跑 [`examples/quickstart/`](../examples/quickstart/)：官方示例 + `daft-ray-ops` 自建镜像，确认 KubeRay 和 RayJob 链路通。
+
+## 为什么只用 RayJob
+
+```text
+问题一   driver 放在哪？        → RayJob：driver 在 head 上，不走 Ray Client
+问题二   集群谁创建、谁回收？  → rayClusterSpec：operator 建、跑完删
+```
+
+| 方式 | 生产可用？ | 原因 |
+|---|---|---|
+| Native runner | 否 | 不能验证分布式调度与 K8s 资源约束 |
+| Ray Client `ray://` | **否** | driver 在集群外，长连接一断作业就死。见[生产禁区](10-production-donts.md) |
+| 常驻 RayCluster + 手工 `ray job submit` | 调参可以 | 无声明式回收，多作业争资源 |
+| **RayJob + `rayClusterSpec`（B）** | **默认** | 一次 CR = 一次作业 + 一套隔离集群 + 自动回收 |
+| RayJob + `clusterSelector`（A） | 调参专用 | 仍是 RayJob，只是集群常驻、不自动删 |
+
+**同一批节点上不要同时跑 B（临时集群）和 A（常驻集群）**——两份 CR 会抢资源。
+
+RayJob 的两种形态（都是 RayJob，不是两套部署方案）：
+
+```text
+spec.rayClusterSpec     → 每作业一套临时集群（20-rayjob.yaml）   生产默认
+spec.clusterSelector    → 提交到已有 RayCluster（41-rayjob-existing.yaml）  调参
+```
 
 ## RayJob 管两样东西
 
@@ -34,25 +63,25 @@ RAY_JOB_SUBMISSION_ID   这次 Ray job 的 submission id
 
 提交器容器按**位置**识别，不是按名字——官方原话是 "the first container is assumed to be the submitter container"。所以 `initContainers` 可以随便加，但不能把别的业务容器排到它前面。也不要自己写它的 `command`：留空时 KubeRay 会用上面两个变量拼出提交命令，写死就等于放弃了 `entrypoint` 字段。
 
-## 改造对照表
+## submissionMode
 
-原来五个文件各管一段生命周期，改完是这样：
+平台集成（Airflow / Argo）默认 **`K8sJobMode`**——多一个 submitter Pod，日志在标准 Pod 日志里，平台抓 task log 不用另接 Dashboard。
 
-| 原文件 | 去处 |
-|---|---|
-| `00-platform.yaml` | 保留。加 `run-bench.sh` / `publish-artifacts.py`，`wait.py` 去掉 ray/dashboard 探针 |
-| `05-daft-dashboard.yaml` | 保留。独立 Deployment 从"更好"变成"必须" |
-| `20-generate-job.yaml` | → `10-generate-job.yaml`，只改编号 |
-| `10-raycluster.yaml` | → `20-rayjob.yaml` 的 `spec.rayClusterSpec` |
-| `30-submit-job.yaml` | → `20-rayjob.yaml` 的 `spec.entrypoint` + `spec.submitterPodTemplate` |
+| mode | 额外 Pod | 日志 | 适合 |
+|---|---|---|---|
+| **K8sJobMode**（默认） | 1 个 submitter Job | submitter Pod | **Airflow / Argo** |
+| SidecarMode | 0，跑在 head 内 | head sidecar | 并发作业很多、省 Pod 数 |
+| InteractiveMode | 0 | 平台自己的通道 | 平台已有统一 SDK |
 
-三个判断值得单独说。
+`20-rayjob.yaml` 用 K8sJobMode，且需要 `submitterPodTemplate` 插 `wait-deps`。
+
+## 三个值得单独说的判断
 
 **不是所有步骤都该做成 RayJob。** `10-generate-job.yaml` 保持普通 `batch/v1` Job：生成是单线程的（每个 clip 一次 ffmpeg + 一次上传），只依赖 MinIO，不需要 Ray。包成 RayJob 等于为一个单进程任务拉起整个集群。**只有真正需要分布式执行的步骤才值得改造。**
 
-**手写的提交逻辑全部删掉。** 原来那 60 行内联 Python（`JobSubmissionClient` → `submit_job` → `tail_job_logs` → 检查终态）是 KubeRay 的内置行为，`submissionMode: K8sJobMode` 就够了。
+**手写的提交逻辑全部删掉。** 那 60 行内联 Python（`JobSubmissionClient` → `submit_job` → `tail_job_logs` → 检查终态）是 KubeRay 的内置行为，`submissionMode: K8sJobMode` 就够了。
 
-**产物必须自己推走。** 这是改造引入的唯一新代码。`benchmark.audio run --run-dir` 只写本地目录，而 `shutdownAfterJobFinishes` 会删掉持有那个目录的 head Pod。所以 `entrypoint` 套了一层 `run-bench.sh`，在 driver 退出前把 `/out/<RUN_ID>` 推到 S3：
+**产物必须自己推走。** `benchmark.audio run --run-dir` 只写本地目录，而 `shutdownAfterJobFinishes` 会删掉持有那个目录的 head Pod。所以 `entrypoint` 套了一层 `run-bench.sh`，在 driver 退出前把 `/out/<RUN_ID>` 推到 S3：
 
 ```bash
 # 故意不用 set -e：benchmark 失败时也必须上传，
@@ -128,7 +157,7 @@ kubectl logs -n daft-bench job/bench-generate -f
 
 10k × 30s 的 clip 要 1–3 小时。同一份数据集复跑作业时跳过这步，`DATA_RUN_ID` 不变即可。
 
-## 步骤 3 · apply RayJob（官方 Step 3）
+## 步骤 3 · apply RayJob
 
 ```bash
 kubectl apply -f examples/kuberay/20-rayjob.yaml
@@ -152,7 +181,7 @@ ConfigMap 挂进来的 key 没有执行位，所以必须显式 `/bin/bash /scri
 
 集群真实预算是 **20 个 Ray CPU**（10 worker × `num-cpus 2`，head 是 0）。`1 × 16 = 16` 占掉其中 16 个，留 4 个给下载、LLM、Lance 写入。不要按 `10 × 8 = 80` 来配 actor。
 
-## 步骤 4 · 核对状态（官方 Step 4）
+## 步骤 4 · 核对状态
 
 ```bash
 kubectl get rayjob daft-audio-bench -n daft-bench -w
@@ -189,9 +218,9 @@ HEAD=$(kubectl get pod -n daft-bench -l ray.io/node-type=head -o jsonpath='{.ite
 kubectl exec -n daft-bench -c ray-head "$HEAD" -- ray status
 ```
 
-Total CPU 不是 20：先 `describe` Pending 的 worker，不要去加 partition。
+Total CPU 不是 20：先 `describe` Pending 的 worker，不要去加 partition。作业跑起来之后的体检和调参见[资源与调参](09-tuning-runbook.md)。
 
-## 步骤 5 · 看输出（官方 Step 5）
+## 步骤 5 · 看输出
 
 ```bash
 # driver 日志（跑在 head 上）
@@ -221,9 +250,9 @@ Daft 自己的查询级观测在 `:3238`，和 Ray Dashboard 的 `:8265` 不是�
 kubectl -n daft-bench port-forward svc/daft-dashboard 3238:3238
 ```
 
-Daft Dashboard 做成独立 Deployment 而不是 head sidecar，在 RayJob 形态下是必须的——sidecar 会跟着集群一起被删，作业跑完就没 UI 可看了。
+Daft Dashboard 做成独立 Deployment 而不是 head sidecar，在 RayJob 形态下是必须的——sidecar 会跟着集群一起被删，作业跑完就没 UI 可看了。完整的日志来源与指标接法见[日志与监控](08-observability.md)。
 
-## 步骤 6 · 回收（官方 Step 7–9）
+## 步骤 6 · 回收
 
 ```yaml
 shutdownAfterJobFinishes: true
@@ -326,7 +355,7 @@ cron 安全的前提是 `run-bench.sh` 第二个参数传 `auto`，每次按 UTC
 | `preRunningDeadlineSeconds` | `1800` | 集群拉不齐时快速失败，别占着节点 |
 | `backoffLimit` | `0` | 每次重试新建一整个集群并重跑，基准测试自动重跑只会污染报表 |
 | `submitterConfig.backoffLimit` | `2` | **默认值就是 2 不是 0**。它只重试"提交"动作，用固定 submission id 重连已在跑的 job，不重跑作业。保留它，提交器 Pod 偶发被驱逐时不至于让 6h 作业作废 |
-| `num-cpus`（head） | `"0"` | 官方套路：head 不接计算，ASR actor 不会落到 2 CPU 的 GCS Pod 上 |
+| `num-cpus`（head） | `"0"` | head 不接计算，ASR actor 不会落到 2 CPU 的 GCS Pod 上 |
 | worker | `10 × 2C/10Gi` | 节点能排下的规格。KubeRay 按 **limits** 上报资源，requests 被忽略，所以 `request == limit` |
 
 ## 作业入口该长什么样
@@ -344,68 +373,19 @@ df = df.into_partitions(40).with_column(...)
 df.write_lance(out_uri, mode="overwrite")      # 生产终点是写出，不是 collect
 ```
 
-不要：`collect()`、`to_pandas()`、`ray://` Client、`set_runner_native()`。理由见[生产禁区](production-donts.md)。
+不要：`collect()`、`to_pandas()`、`ray://` Client、`set_runner_native()`。理由见[生产禁区](10-production-donts.md)。
 
-`default_morsel_size` 只能通过 `set_execution_config` 传——Daft 自己不读 `DAFT_DEFAULT_MORSEL_SIZE` 环境变量。`00-platform.yaml` 里设了这个变量却能生效，是因为**应用代码**（`config.py` → `pipeline.py`）把它读出来再显式传进 `set_execution_config`。细节见 [Morsel](../02-principles/morsel.md)。
+`00-platform.yaml` 里设了 `DAFT_DEFAULT_MORSEL_SIZE` 却能生效，是因为**应用代码**把它读出来再显式传进 `set_execution_config`——Daft 自己不读这个环境变量。见 [Morsel 与 into_batches](05-morsel-batch.md)。
 
-## 三十秒体检
+## 镜像从哪来
 
-作业还在跑的时候：
+**Daft 没有官方镜像。** 官方 Helm chart 用的是 Ray 官方的 `rayproject/ray`，Daft 靠 `uv` 和 `runtime_env={"pip": [...]}` 在运行时装——离线不可用，且 driver 与 worker 的版本没有任何保证。
 
-```bash
-kubectl exec -n daft-bench -c ray-head "$HEAD" -- ray status
-kubectl get pods -n daft-bench -l ray.io/node-type=worker
-kubectl exec -n daft-bench -c ray-head "$HEAD" -- ray list actors --address http://127.0.0.1:8265
-```
-
-```text
-Total CPU < 20     worker 没齐，先查 Pending，不要动 Daft 参数
-RESTARTS 在涨      内存问题，先留现场
-actor RESTARTING   等下去没有意义
-```
-
-完整排障见[如何看日志](../04-observability/logs.md)和[根据监控调参](../04-observability/tune-from-metrics.md)。
-
-## 官方镜像 + 官方示例
-
-[`examples/quickstart/`](../../examples/quickstart/) 是同一种形态（RayJob + 临时集群）的最小版本，只有两个文件：
-
-```bash
-kubectl apply -f examples/quickstart/00-configmap-script.yaml
-kubectl apply -f examples/quickstart/10-rayjob.yaml
-kubectl logs -n daft-quickstart -l job-name=daft-quickstart -f
-```
-
-**先纠正一个常见误解：Daft 没有官方镜像。** 官方 Helm chart（Daft 仓库 `k8s/charts/quickstart`）的默认镜像是 Ray 官方的 `rayproject/ray:2.46.0-py312-cpu`，Daft 是运行时装进去的——driver 靠 `uv run --script` 读 PEP 723 内联依赖，worker 靠 `ray.init(runtime_env={"pip": ["daft"]})`。`uv` 这条路能走通是因为 Ray 2.45 起官方镜像自带它。
-
-所以有三处版本必须对齐，否则 driver 连不上 GCS（`uv` 建的 venv 是隔离的，不复用镜像里的 ray）：镜像 tag、`rayVersion`、脚本里的 `ray[client]==2.46.0`。
-
-示例脚本是官方文档的原文，一字不改，包括 `print(df.collect())`。这样照抄的代价是它同时踩了本手册三条红线，而这正好是最好的对照材料：
-
-| 官方 quickstart 怎么写 | 生产该怎么写 | 为什么 |
-|---|---|---|
-| `print(df.collect())` | `df.write_parquet(...)` | `collect()` 把整个结果拉回 driver |
-| `uv run` + `runtime_env={"pip": [...]}` | 依赖烤进镜像 | 每个 worker 都要连 PyPI；离线不可用；driver/worker 版本无保证 |
-| `dependencies = ["daft"]` | `daft==0.7.x` | 不锁版本，今天和下周跑的不是同一个引擎 |
-
-反过来，改成 RayJob 之后有一处比官方 chart 更对：官方 chart 的 job 模板设 `RAY_ADDRESS=ray://<head>:10001`，走的是 [Ray Client](production-donts.md)——driver 在集群外，靠一条脆弱的长连接代理。RayJob 的 driver 由 Jobs API 拉起、跑在 head 上，`ray.init()` 直连本地 GCS，这条网络路径根本不存在。
-
-官方 chart 本身不用 KubeRay（"No operator required: Uses native Kubernetes resources only"，head/worker 是 `Deployment`，作业是 `batch/v1` Job）。想先跑原版：
-
-```bash
-helm install my-job oci://ghcr.io/eventual-inc/daft/quickstart \
-  --set distributed=true --set worker.replicas=3 \
-  --set-file job.script=main.py
-```
-
-`quickstart` 那套**离线跑不了**（依赖是运行时装的）。内网环境直接用 `examples/kuberay/`。
+生产必须把依赖烤进镜像。[`examples/docker/`](../examples/docker/) 是一份可以直接用的模板：Ray 基础镜像 + 锁死版本的 Daft + 一套排障 CLI（`curl` / `jq` / `mc` / `top` / `netstat`）。跑通链路的最小示例见 [`examples/quickstart/`](../examples/quickstart/)，那里也解释了官方 chart 的三处差异。
 
 ## 清理
 
 ```bash
-# quickstart 那套
-kubectl delete rayjob daft-quickstart -n daft-quickstart --ignore-not-found
-
 # 临时集群路径：删 RayJob，operator 把它建的集群一起带走
 kubectl delete rayjob daft-audio-bench -n daft-bench --ignore-not-found
 kubectl delete raycronjob daft-audio-nightly -n daft-bench --ignore-not-found
