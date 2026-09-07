@@ -2,12 +2,67 @@
 
 这一页只回答一件事：作业在集群上到底怎么跑。后面所有部署约束、调参顺序和内存判断，都从这里推出来。
 
+## 四层各管什么
+
+Kubernetes、KubeRay、Ray、Daft 是四个互不替代的层。分不清谁管什么，排障时就会在错的层上调参。
+
+```mermaid
+flowchart TB
+    DAFT["<b>Daft</b> —— 数据怎么切、怎么流<br/>Flotilla 切 task　·　Swordfish 在 worker 内执行"]
+    RAY["<b>Ray</b> —— 进程、资源账本、容错<br/>GCS　·　raylet　·　object store　·　Jobs API"]
+    KR["<b>KubeRay</b> —— 声明式地把一次作业变成 Pod<br/>读 CR → 建集群 → 提交 → 回收"]
+    K8S["<b>Kubernetes</b> —— Pod 生死与 cgroup 额度<br/>OOMKilled / CPU throttling 的唯一权威"]
+
+    DAFT -->|"跑在 Ray 之上"| RAY
+    RAY -->|"进程住在 Pod 里"| KR
+    KR -->|"Pod 由 K8s 调度"| K8S
+```
+
+箭头是"依赖谁"。**排障时反着走**：先确认 Pod 活着，再看 CR 到哪一步，再看 Ray 的 task / actor，最后才怀疑 Daft 的参数。各层的指标与日志出口见[日志与监控](08-observability.md)。
+
+一个直接后果：Daft 的旋钮解决不了下面三层的问题。worker Pod 没起来时调 `default_morsel_size` 没有任何意义。
+
 ## Flotilla 与 Swordfish
 
 ```text
 Flotilla    分布式调度层，跑在 head。切分 task，决定派给哪个 worker
 Swordfish   单机流式执行引擎（Rust），跑在每个 worker。把一个 task 在机器内部跑完
 ```
+
+一次 RayJob 跑起来之后，进程拓扑长这样：
+
+```mermaid
+flowchart TB
+    subgraph HEAD["head Pod　·　num-cpus=0，不接计算"]
+        direction TB
+        GCS["Ray GCS / Jobs API / Dashboard :8265"]
+        DRV["Daft driver：构造并优化 LogicalPlan"]
+        FLO["Flotilla：切 task，按局部性与负载派发"]
+        DRV --> FLO
+    end
+
+    subgraph WA["worker Pod A"]
+        direction TB
+        SWA["Swordfish：把一个 task 在进程内跑完"]
+        OSA["Ray object store　/dev/shm"]
+        SWA --- OSA
+    end
+
+    subgraph WB["worker Pod B"]
+        direction TB
+        SWB["Swordfish"]
+        OSB["Ray object store　/dev/shm"]
+        SWB --- OSB
+    end
+
+    FLO -->|"派发 task = 1 个 partition"| SWA
+    FLO -->|"派发 task = 1 个 partition"| SWB
+    SWA -.->|"只回传 metadata"| FLO
+    SWB -.->|"只回传 metadata"| FLO
+    OSA <-->|"只有 shuffle 才跨节点拉数据"| OSB
+```
+
+图里三件事后面会反复用到：head 上没有计算、数据本体不回 driver、map-only 链路 worker 之间不通信。
 
 - **Native runner** 只有 Swordfish：进程内把计划跑完，没有跨机调度。
 - **Ray runner** 是 Flotilla + Swordfish 的嵌套：Flotilla 负责调度，task 落到 worker 之后，执行体仍然是 Swordfish。

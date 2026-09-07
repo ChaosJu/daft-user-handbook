@@ -46,6 +46,26 @@ RayJob CR
   └─ Submitter    一个 K8s Job，跑 `ray job submit --address ... -- $entrypoint`
 ```
 
+一次 `kubectl apply` 之后，KubeRay、Ray、Daft 三方是这样接力的：
+
+```mermaid
+flowchart TB
+    APPLY["kubectl apply -f 20-rayjob.yaml"] --> CR["RayJob CR"]
+    CR --> OP["kuberay-operator"]
+
+    OP -->|"① 按 rayClusterSpec 建集群"| RC["RayCluster"]
+    RC --> HEAD["head Pod<br/>Ray GCS + Jobs API :8265"]
+    RC --> WK["worker Pod × N<br/>raylet + object store"]
+
+    OP -->|"② 等集群 ready 才建提交器"| SUB["Submitter：一个普通 K8s Job<br/>ray job submit --address $RAY_DASHBOARD_ADDRESS"]
+    SUB -->|"③ HTTP 提交 entrypoint"| HEAD
+    HEAD -->|"④ 在 head 上拉起 driver 进程"| DRV["Daft driver　=　你的 entrypoint"]
+    DRV -->|"⑤ set_runner_ray() 连本地 GCS，派 task"| WK
+    OP -->|"⑥ 终态后按 ttlSecondsAfterFinished 回收"| RC
+```
+
+第 ④ 步是关键：**driver 跑在 head Pod 里，不在 submitter 里**。submitter 只负责发起一次 HTTP 提交、然后 tail 日志，它自己挂掉不会带走作业。这正是 RayJob 和 Ray Client 的根本区别——后者的 driver 在集群外，长连接一断作业就死。
+
 三个不要混的词：
 
 | 词 | 是什么 |
@@ -105,6 +125,23 @@ exit "$rc"
 | 失败后 | 集群没了，只剩日志和 S3 产物 | 集群还在，能 `exec` 进 head 翻 `/tmp/ray` |
 | 自动回收 | `shutdownAfterJobFinishes: true` | 不支持 |
 | 适合 | 生产批处理、定时任务 | 连续调参、交互排查、严格独占节点做对比基准 |
+
+```mermaid
+flowchart TB
+    subgraph A["路径 A · 临时集群　—— 生产默认"]
+        direction LR
+        A1["RayJob<br/>spec.rayClusterSpec"] --> A2["operator 新建一套 RayCluster"] --> A3["跑作业"] --> A4["shutdownAfterJobFinishes<br/>集群连同现场一起删掉"]
+    end
+
+    subgraph B["路径 B · 常驻集群　—— 调参用"]
+        direction LR
+        B0["RayCluster<br/>手动 apply，一直在"] --> B2["跑作业"]
+        B1["RayJob<br/>spec.clusterSelector"] --> B2
+        B2 --> B3["集群还在<br/>能 exec 进 head 翻 /tmp/ray"]
+    end
+
+    A ~~~ B
+```
 
 两者**二选一**，KubeRay 的校验原话是 "one of RayClusterSpec or ClusterSelector must be set"。
 

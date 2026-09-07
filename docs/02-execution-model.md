@@ -6,6 +6,16 @@
 
 `select`、`where`、`with_column`、`join`、`groupby` 只构建 LogicalPlan，不读数据、不占 worker。
 
+```mermaid
+flowchart LR
+    A["read_parquet<br/>read_lance"] --> B["select / where<br/>with_column / join<br/>只往 LogicalPlan 上加节点"]
+    B --> C{"接下来调用了什么"}
+    C -->|"还是变换"| B
+    C -->|"write_parquet 等"| D["✅ 执行整图<br/>数据落对象存储<br/>只有元数据回 driver"]
+    C -->|"collect / to_pandas"| E["⚠️ 执行整图<br/>全部结果拉回 driver 内存"]
+    C -->|"show(n)"| F["只跑出前 n 行所需的工作<br/>仍然会启动执行"]
+```
+
 下列操作会**触发执行**：
 
 | 动作 | 会做什么 | 生产能不能当终点 |
@@ -51,6 +61,37 @@ daft.set_runner_ray()
 Native 验证的是 Swordfish 的正确性与单机内存行为。它**不能**验证分布式调度、资源约束和故障语义。多节点生产必须用 Ray runner。
 
 ## 3. Partition、morsel、batch 各管什么
+
+这三个词最容易混。两张图看清它们的嵌套关系——**partition 是横向的（几个 task 并行），morsel 和 batch 是纵向的（一个 task 内部怎么流）**。先**横向**看并行度：
+
+```mermaid
+flowchart LR
+    DF["df = daft.read_parquet(...)<br/>.into_partitions(64)"]
+    DF --> P0["partition 0"] --> WA["Ray task　·　worker A"]
+    DF --> P1["partition 1"] --> WB["Ray task　·　worker B"]
+    DF --> PN["…　partition 63"] --> WC["Ray task　·　worker C"]
+```
+
+再把上面 worker B 那个 task 放大，**纵向**看它内部：Swordfish 把数据切成 morsel，一段一段推过算子链，全程不物化整个 partition。
+
+```mermaid
+flowchart LR
+    SCAN["scan"] -->|"morsel<br/>≤ default_morsel_size 行"| PROJ["filter / project"]
+    PROJ -->|"morsel"| IB["into_batches(16)"]
+    IB -->|"≈16 行一批"| UDF["UDF<br/>batch_size ≤ 16"]
+    UDF -->|"morsel"| WR["write"]
+```
+
+换算关系：
+
+```text
+1 个 DataFrame  =  N 个 partition          ← into_partitions(N) / repartition(N)
+1 个 partition  =  1 个 Ray task           ← 并行度、重算粒度、写出文件数
+1 个 task       =  很多 morsel 依次流过     ← default_morsel_size / into_batches(n)
+1 个 morsel     ≥  1 个 UDF batch          ← batch_size 吃不到比上游 morsel 更大的批
+```
+
+所以：**加 partition 只让更多 task 并行，不会让单个 task 少占内存**；反过来，压小 morsel 只让单 task 更省，不会提高并行度。峰值内存约等于 `并发 task 数 × 单 task 在途 morsel × 单行体积`，两个方向都得看。
 
 | | Partition | Morsel / batch |
 |---|---|---|
