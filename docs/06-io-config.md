@@ -1,6 +1,6 @@
 # 读写参数配置
 
-I/O 参数分三层：planning 默认的 `IOConfig`、每次 `read_*` / `write_*` 的 API 参数、execution config 里的文件形态旋钮。改了没生效时，先确认改的是哪一层。
+I/O 参数分三层：planning 默认的 `IOConfig`、每次 `read_*` / `write_*` 的 API 参数、execution config 里的文件形态参数。改了没生效时，先确认改的是哪一层。
 
 ## 默认 IOConfig
 
@@ -65,7 +65,7 @@ df = df.into_batches(8).with_column(
 
 在途字节 ≈ `min(batch 行数, max_connections)` × 单对象大小。16 行一批、每行 4 MB 图、32 路下载，一个 task 就能同时在途数百 MB，再乘并发 task 数。
 
-对象存储限流、worker 内存爬升、decode 前 working set 陡增时，先把 `download(max_connections)` 从 32 降到 4～8，再动 morsel。压批的位置见 [Morsel 与 into_batches](05-morsel-batch.md)。
+对象存储限流、worker 内存爬升、decode 前 working set 陡增时，先把 `download(max_connections)` 从 32 降到 4～8，再动 morsel。压批位置见[执行模型](02-execution-model.md)。
 
 ## Parquet 读
 

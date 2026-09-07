@@ -24,7 +24,7 @@
 | 方式 | 生产可用？ | 原因 |
 |---|---|---|
 | Native runner | 否 | 不能验证分布式调度与 K8s 资源约束 |
-| Ray Client `ray://` | **否** | driver 在集群外，长连接一断作业就死。见[生产禁区](10-production-donts.md) |
+| Ray Client `ray://` | **否** | driver 在集群外，长连接一断作业就死。见[生产禁区](09-production-donts.md) |
 | 常驻 RayCluster + 手工 `ray job submit` | 调参可以 | 无声明式回收，多作业争资源 |
 | **RayJob + `rayClusterSpec`（B）** | **默认** | 一次 CR = 一次作业 + 一套隔离集群 + 自动回收 |
 | RayJob + `clusterSelector`（A） | 调参专用 | 仍是 RayJob，只是集群常驻、不自动删 |
@@ -255,7 +255,7 @@ HEAD=$(kubectl get pod -n daft-bench -l ray.io/node-type=head -o jsonpath='{.ite
 kubectl exec -n daft-bench -c ray-head "$HEAD" -- ray status
 ```
 
-Total CPU 不是 20：先 `describe` Pending 的 worker，不要去加 partition。作业跑起来之后的体检和调参见[资源与调参](09-tuning-runbook.md)。
+Total CPU 不是 20：先 `describe` Pending 的 worker，不要去加 partition。作业跑起来之后的体检和调参见[资源与调参](08-tuning-runbook.md)。
 
 ## 步骤 5 · 看输出
 
@@ -287,7 +287,7 @@ Daft 自己的查询级观测在 `:3238`，和 Ray Dashboard 的 `:8265` 不是�
 kubectl -n daft-bench port-forward svc/daft-dashboard 3238:3238
 ```
 
-Daft Dashboard 做成独立 Deployment 而不是 head sidecar，在 RayJob 形态下是必须的——sidecar 会跟着集群一起被删，作业跑完就没 UI 可看了。完整的日志来源与指标接法见[日志与监控](08-observability.md)。
+Daft Dashboard 做成独立 Deployment 而不是 head sidecar，在 RayJob 形态下是必须的——sidecar 会跟着集群一起被删，作业跑完就没 UI 可看了。完整的日志来源与指标接法见[日志与监控](07-observability.md)。
 
 ## 步骤 6 · 回收
 
@@ -402,7 +402,7 @@ import daft
 
 daft.set_runner_ray()                          # driver 已在集群内，不用传 address
 daft.set_execution_config(
-    default_morsel_size=8,                     # 胖行的第一内存旋钮
+    default_morsel_size=8,                     # 胖行时优先改的全局 morsel
     maintain_order=False,
 )
 df = daft.read_parquet(manifest_uri)
@@ -410,9 +410,9 @@ df = df.into_partitions(40).with_column(...)
 df.write_lance(out_uri, mode="overwrite")      # 生产终点是写出，不是 collect
 ```
 
-不要：`collect()`、`to_pandas()`、`ray://` Client、`set_runner_native()`。理由见[生产禁区](10-production-donts.md)。
+不要：`collect()`、`to_pandas()`、`ray://` Client、`set_runner_native()`。理由见[生产禁区](09-production-donts.md)。
 
-`00-platform.yaml` 里设了 `DAFT_DEFAULT_MORSEL_SIZE` 却能生效，是因为**应用代码**把它读出来再显式传进 `set_execution_config`——Daft 自己不读这个环境变量。见 [Morsel 与 into_batches](05-morsel-batch.md)。
+`00-platform.yaml` 里设了 `DAFT_DEFAULT_MORSEL_SIZE` 却能生效，是因为**应用代码**把它读出来再显式传进 `set_execution_config`——Daft 自己不读这个环境变量。见[执行模型](02-execution-model.md)。
 
 ## 镜像从哪来
 

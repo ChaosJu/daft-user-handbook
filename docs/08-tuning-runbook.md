@@ -92,7 +92,36 @@ actor RESTARTING     初始化在反复重做，吞吐会持续恶化，等下�
 | `OTEL_EXPORTER_OTLP_*` | Daft 指标出不到 Prometheus |
 | `DAFT_ANALYTICS_ENABLED` | 默认开启，内网 / 离线应设 `0` |
 
-另外记住：Daft 不读 `DAFT_DEFAULT_MORSEL_SIZE`，`default_morsel_size` 必须经 `set_execution_config` 传进去，见 [Morsel 与 into_batches](05-morsel-batch.md)。
+另外记住：Daft 不读 `DAFT_DEFAULT_MORSEL_SIZE`，`default_morsel_size` 必须经 `set_execution_config` 传进去。机制见[执行模型](02-execution-model.md)。
+
+## Morsel 怎么调
+
+按行形态选起点（行）：
+
+| 行形态 | 起点 | 典型列 |
+|---|---:|---|
+| 窄表、标量列 | 1024 ～ 131072 | int / float / 短字符串 |
+| 大字符串、百 KB 级对象 | 16 ～ 64 | 长文本、小图片 bytes、JSON blob |
+| MB 级对象、解码结果 | 4 ～ 16 | 解码图像、解压后文档 |
+| 大 tensor / 重中间状态 | 1 ～ 8 | 视觉模型输入、大 embedding |
+
+起点不是最优值。用 1× / 2× / 4× 做小范围 sweep，同时看 working set 与吞吐。
+
+**减小** morsel / `into_batches`：OOM 或 working set 逼近 limit、Object Store spill 上升、decode / explode / UDF 后单行暴涨、actor 反复 `RESTARTING`。
+
+**增大**：CPU 低但内存安全（P95 working set < 60% limit）、调度开销高 / 极碎小批占满时间线、窄表标量链路模型吞吐吃不满。
+
+**调小无效时**：pipeline 里有 blocking sink（见[架构](01-architecture.md)）。先改算法、减 key 基数、换 broadcast / 去 shuffle，再回头看 morsel。不要从 131072 直接砍到 1，除非行已经是 MB 级。
+
+操作顺序：
+
+```text
+1  explain()，确认膨胀点前后没有意外的 blocking sink
+2  只在膨胀点之前插 into_batches
+3  显式写 download(max_connections=...)
+4  仍 OOM 再降全局 default_morsel_size
+5  内存安全但 CPU 低，再把批往上加找拐点
+```
 
 ## Worker：少而大
 
@@ -193,7 +222,7 @@ head 跑 GCS、Dashboard、Jobs API、Flotilla 和 driver。不要在 head 上�
 
 ## Partition 与 actor 怎么跟资源走
 
-partition 起点公式见 [Partition](04-partition.md)。actor 数由两条不等式和内存共同决定，完整推导见 [UDF](06-udf.md)：
+partition 起点公式见 [Partition](04-partition.md)。actor 数由两条不等式和内存共同决定，完整推导见 [UDF](05-udf.md)：
 
 ```text
 最终 actor 数 = min(按 CPU 能放的, 按内存能放的)，再留 1～2 核给 I/O 和 Ray

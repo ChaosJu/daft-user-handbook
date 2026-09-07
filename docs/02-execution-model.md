@@ -113,11 +113,67 @@ df = df.repartition(64, "user_id") # 按 key 哈希共址
 df = df.into_batches(1_000)
 ```
 
-`into_partitions` 便宜，只做机械拆分 / 合并；`repartition` 贵，走全局 shuffle。只想改 task 数时不要用 `repartition`。三个 API 的完整决策表、scan 侧切分和起点公式在 [Partition](04-partition.md)。
+`into_partitions` 便宜，只做机械拆分 / 合并；`repartition` 贵，走全局 shuffle。只想改 task 数时不要用 `repartition`。partition 的完整决策表、scan 侧切分和起点公式在 [Partition](04-partition.md)。**`into_batches` 在 Ray 上还会重切 partition**，见该页。
 
-有一个例外值得先记住：**`into_batches` 在 Ray runner 上会重切 partition**，它不只是"改行批"。机制见 [Morsel 与 into_batches](05-morsel-batch.md)。
+## 4. Morsel 与 into_batches
 
-## 4. 内存由多个资源池共同构成
+单 task 峰值内存靠这一节。`default_morsel_size` 与 `into_batches` 共用 `MorselSizeRequirement`、单位都是行，但语义不同：
+
+| | `default_morsel_size` | `into_batches(n)` |
+|---|---|---|
+| 是什么 | execution config 里的一个数 | **计划里的节点**，出现在 `explain()` 里 |
+| 注入的要求 | `Flexible(0, N)` | `Flexible(⌊0.8n⌋, n)` |
+| 下界 | **0——从不攒批** | **0.8n——攒够才发** |
+| 作用范围 | 整条 pipeline 兜底 | 从该节点**向上游**传播，直到 blocking sink |
+| Ray 上 | 只影响 task 内部 | **task 边界，会重切 partition** |
+
+想让 scan 少读几行，用 `into_batches`；想给整条链路定保守默认值，才用 `default_morsel_size`。两者都调时取交集。
+
+行批要求从 sink **往上游**递归传播：每个算子 `effective = combine(自己的要求, 下游要求)` 再传给上游；`Strict` 优先，两个 `Flexible` 取区间交集。下界为 0 的算子**从不攒批**——上游给多少就推多少，所以 `into_batches(16)` 之后的 project / UDF 不会把 16 行重新攒回 131072 行。
+
+两条用法推论：
+
+- **`into_batches` 插在膨胀算子之前**（download、decode、explode、模型推理）。插在 decode 之后管不到 decode 本身。
+- **要求穿不过 blocking sink**。`sort` / `aggregate` / join build 侧下游的 `into_batches` 管不到它上游的 scan。
+- 背靠背两个 `into_batches` 会被优化器折叠，**保留下游那个**。
+
+默认值与生效方式：
+
+```text
+default_morsel_size = 131072 行（128 × 1024），单位是行不是字节
+```
+
+窄表标量列的默认值。URL、blob、解码图像、embedding 继续用 131072，单批可到数 GB。
+
+**Daft 不读 `DAFT_DEFAULT_MORSEL_SIZE` 环境变量**——`DaftExecutionConfig::from_env` 白名单里没有它，设了不报错、morsel 静默保持 131072。唯一入口：
+
+```python
+daft.set_execution_config(default_morsel_size=64)
+```
+
+部署 YAML 里设了这个变量却能生效，是因为**应用自己读出来再传** `set_execution_config`。判断有没有用，看入口代码，不看 YAML。
+
+典型用法——全局 morsel 保持吞吐，只在膨胀点前压批：
+
+```python
+daft.context.set_execution_config(default_morsel_size=8192)
+
+df = (
+    daft.read_parquet("s3://bucket/meta/*.parquet")
+    .select("id", "url")
+    .into_batches(16)
+    .with_column("bytes", daft.col("url").url.download(max_connections=8))
+    .with_column("image", daft.col("bytes").image.decode())
+)
+```
+
+不需要输出顺序时 `maintain_order=False`（也可用环境变量 `DAFT_MAINTAIN_ORDER=false`，在白名单里）。保序会引入排序缓冲。
+
+动态批默认关闭。生产先把静态 morsel 跑稳，再评估 `enable_dynamic_batching`，不要两件事一起开。
+
+四个数字相乘才是在途字节——partition × morsel × UDF `batch_size` × `max_concurrency`。`download(max_connections)` 默认 32 且会顶掉 `S3Config`，见[读写参数](06-io-config.md)。按行形态选起点、何时增减、操作顺序见[资源与调参](08-tuning-runbook.md)。
+
+## 5. 内存由多个资源池共同构成
 
 一次 Daft 作业的峰值内存不只来自 DataFrame：
 
@@ -131,8 +187,8 @@ df = df.into_batches(1_000)
 + Python / Rust / Ray 系统进程
 ```
 
-因此，单独增加 partition 或设置 `DAFT_MEMORY_LIMIT` 不能保证避免 OOM。OOM 时先判断是哪一项在涨，再决定动哪个旋钮。
+因此，单独增加 partition 或设置 `DAFT_MEMORY_LIMIT` 不能保证避免 OOM。OOM 时先判断是哪一项在涨，再决定该调哪一项。
 
 容器里不设 `DAFT_MEMORY_LIMIT` 时，Daft 可能按**宿主机总内存**做预算。limit 8 GiB、宿主机 256 GiB，引擎会以为自己很宽裕，然后被 cgroup 直接 OOMKilled。
 
-判断 Pod 是否触顶，只认 cgroup working set，不要用容器内 `psutil.virtual_memory()`。各资源池怎么分预算见[资源与调参](09-tuning-runbook.md)。
+判断 Pod 是否触顶，只认 cgroup working set，不要用容器内 `psutil.virtual_memory()`。各资源池怎么分预算见[资源与调参](08-tuning-runbook.md)。

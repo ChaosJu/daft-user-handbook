@@ -58,7 +58,7 @@ kubectl apply -f 10-rayjob.yaml
 | --- | --- |
 | `uv` + `runtime_env={"pip": [...]}` | 每次作业、每个 worker 都要连 PyPI；**离线完全不可用** |
 | `dependencies = ["daft"]` 不锁版本 | 今天跑和下周跑不是同一个引擎 |
-| `RAY_ADDRESS=ray://<head>:10001` | 走 [Ray Client](../../docs/10-production-donts.md)，driver 在集群外，长连接一断作业就死 |
+| `RAY_ADDRESS=ray://<head>:10001` | 走 [Ray Client](../../docs/09-production-donts.md)，driver 在集群外，长连接一断作业就死 |
 
 改成「依赖烤进镜像 + RayJob」之后三个问题一起消失：依赖是不可变制品，driver 由 Jobs API 拉起、跑在 head 上，`ray.init()` 直连本地 GCS。
 
@@ -78,7 +78,7 @@ helm install my-job oci://ghcr.io/eventual-inc/daft/quickstart \
 df.write_parquet("s3://bucket/out", write_mode="overwrite")
 ```
 
-完整清单见[生产禁区](../../docs/10-production-donts.md)。
+完整清单见[生产禁区](../../docs/09-production-donts.md)。
 
 ## k3s 上的两个坑
 

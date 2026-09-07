@@ -18,9 +18,9 @@ flowchart TB
     KR -->|"Pod 由 K8s 调度"| K8S
 ```
 
-箭头是"依赖谁"。**排障时反着走**：先确认 Pod 活着，再看 CR 到哪一步，再看 Ray 的 task / actor，最后才怀疑 Daft 的参数。各层的指标与日志出口见[日志与监控](08-observability.md)。
+箭头是"依赖谁"。**排障时反着走**：先确认 Pod 活着，再看 CR 到哪一步，再看 Ray 的 task / actor，最后才怀疑 Daft 的参数。各层的指标与日志出口见[日志与监控](07-observability.md)。
 
-一个直接后果：Daft 的旋钮解决不了下面三层的问题。worker Pod 没起来时调 `default_morsel_size` 没有任何意义。
+一个直接后果：Daft 侧调参解决不了下面三层的问题。worker Pod 没起来时调 `default_morsel_size` 没有任何意义。
 
 ## Flotilla 与 Swordfish
 
@@ -90,7 +90,7 @@ Execution     把物理计划翻译成 pipeline
 
 峰值内存因此与数据总量脱钩，只取决于**在途 morsel**：并发 task × 在途 morsel 数 × 单行实际体积。数据总量翻十倍，只要在途量不变，峰值可以不变。
 
-`morsel` 配的是**行数，不是字节**。URL 列只有几十字节，下载解码之后可能是几 MB。同一个 morsel 行数在 scan 与 decode 之后可以差三个数量级。行批要求怎么在算子之间传播、两个旋钮各自管什么，见 [Morsel 与 into_batches](05-morsel-batch.md)。
+`morsel` 配的是**行数，不是字节**。URL 列只有几十字节，下载解码之后可能是几 MB。同一个 morsel 行数在 scan 与 decode 之后可以差三个数量级。`default_morsel_size` 与 `into_batches` 的对比和传播机制见[执行模型](02-execution-model.md)。
 
 ## 算子分两类
 
@@ -133,7 +133,7 @@ row group 缓冲     parquet_target_row_group_size，默认 128MB（in-memory �
 结果元数据          文件条数 × 每条 stats，最终回到 driver
 ```
 
-写出侧内存高，先看 `partition_cols` 的基数，再看 row group 目标值。不要把 WriteSink 理解成"全表物化后再写"。参数见[读写参数](07-io-config.md)。
+写出侧内存高，先看 `partition_cols` 的基数，再看 row group 目标值。不要把 WriteSink 理解成"全表物化后再写"。参数见[读写参数](06-io-config.md)。
 
 ## Flotilla：task = partition，driver 只持有 metadata
 
@@ -149,7 +149,7 @@ Scheduler 按数据局部性和 worker 负载分配 task。**一个 task 对应�
 1. **partition 数的上限由 driver 决定。** 它管理的 metadata 条数随 partition 增长，与数据体积无关。
 2. **每个节点一个 Swordfish worker，不是一核一个进程。** 一核一个时，单个 worker 拿到一批文件必须下载完才能解析、推理，阶段间串行；一节点一个时，I/O 与计算在 worker 内部重叠。
 
-由此推出：**worker pod 应当少而大**。把 64 核拆成 64 个 1 核 pod，会把流水线切碎，I/O 与计算无法重叠。具体规格见[资源与调参](09-tuning-runbook.md)。
+由此推出：**worker pod 应当少而大**。把 64 核拆成 64 个 1 核 pod，会把流水线切碎，I/O 与计算无法重叠。具体规格见[资源与调参](08-tuning-runbook.md)。
 
 ## 失败语义：task 级重算
 
@@ -190,11 +190,11 @@ Ray 调度只读 num-cpus，真正的约束是 cgroup
 共享同一个额度，不可重复扣减
 ```
 
-内存**不参与调度决策**。Flotilla 按 CPU/GPU 和负载派 task，不判断该节点的内存是否承载得下。余量必须自己留，预算公式见[资源与调参](09-tuning-runbook.md)。
+内存**不参与调度决策**。Flotilla 按 CPU/GPU 和负载派 task，不判断该节点的内存是否承载得下。余量必须自己留，预算公式见[资源与调参](08-tuning-runbook.md)。
 
-## 四个旋钮，各归一层
+## 四个维度，各管一层
 
-| 旋钮 | 所在层 | 控制 | 过小 | 过大 |
+| 维度 | 所在层 | 控制 | 过小 | 过大 |
 |---|---|---|---|---|
 | **partition** | Flotilla | task 数、并行度、重算粒度 | worker 空闲、单 task 过重 | driver metadata 压力、小文件增多 |
 | **morsel** | Swordfish | 单 task 内的在途行批 | 调度与批处理开销上升 | 峰值内存与尾延迟上升 |

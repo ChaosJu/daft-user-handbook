@@ -90,7 +90,6 @@ kubectl -n "$NS" exec -c ray-head "$HEAD" -- ls -lt /tmp/ray/session_latest/logs
 ② 常用   ray job logs <submission_id>     driver 全量输出，日常首选
 ③ 直观   Dashboard 8265 → Logs 页签       按节点 / 进程浏览，仅当前会话有效
 ④ 最全   exec 进 Pod 翻 /tmp/ray/.../logs 唯一能看到 worker 内部的方式
-⑤ 生产   集中式日志（Loki / ES）          唯一能在 Pod 消失之后还查得到的方式
 ```
 
 ```bash
@@ -227,7 +226,7 @@ container_memory_working_set_bytes{namespace="$NS",container="ray-worker"}
 container_spec_memory_limit_bytes{namespace="$NS",container="ray-worker"}
 ```
 
-门禁阈值见[资源与调参](09-tuning-runbook.md)。
+门禁阈值见[资源与调参](08-tuning-runbook.md)。
 
 ## KubeRay：CR 卡在哪一步
 
@@ -307,7 +306,7 @@ cgroup OOMKilled           kube_pod_container_status_last_terminated_reason
 
 ![按 Ray 组件与算子拆分的 CPU 占用面板](images/ray-cpu-by-component.png)
 
-能把消耗拆到算子级，图中可见 `PhysicalScan->Project->UDFProject->DataSink` 这样的完整链路。UDF 占大头就去调 [UDF](06-udf.md) 的并发与 batch；`gcs` / `dashboard` 占大头则是 head 被压，检查是不是把计算派到了 head 上。
+能把消耗拆到算子级，图中可见 `PhysicalScan->Project->UDFProject->DataSink` 这样的完整链路。UDF 占大头就去调 [UDF](05-udf.md) 的并发与 batch；`gcs` / `dashboard` 占大头则是 head 被压，检查是不是把计算派到了 head 上。
 
 **内存：三条线要分开看**
 
@@ -319,7 +318,7 @@ usage vs limit 判 OOMKilled 风险；growth per hour 判是否在累积——�
 
 ![Object store by Location（MMAP_DISK / MMAP_SHM / SPILLED / WORKER_HEAP）与 Spill rate 面板](images/ray-object-store-spill.png)
 
-`SPILLED` 一旦离开 0 就说明对象存储装不下、Ray 开始打盘，吞吐会显著下滑（这次截图里 SPILLED 累计到了 3.27 TiB，spill rate 全程二三十 MiB/s）。持续非零的 spill 是必须处理的信号，不是可以忍的背景噪声，处理顺序见[资源与调参](09-tuning-runbook.md)。
+`SPILLED` 一旦离开 0 就说明对象存储装不下、Ray 开始打盘，吞吐会显著下滑（这次截图里 SPILLED 累计到了 3.27 TiB，spill rate 全程二三十 MiB/s）。持续非零的 spill 是必须处理的信号，不是可以忍的背景噪声，处理顺序见[资源与调参](08-tuning-runbook.md)。
 
 ## Daft：OTLP push
 
@@ -412,4 +411,4 @@ kubectl -n "$NS" cp "$HEAD":/tmp/ray/session_latest/metrics/grafana/dashboards/ 
 
 要在 Ray Dashboard 内嵌 Grafana，head 上三个变量：`RAY_GRAFANA_HOST`（后端健康检查）、`RAY_GRAFANA_IFRAME_HOST`（浏览器取图）、`RAY_PROMETHEUS_HOST`。前两个不是一回事，配混了页面就是空白。
 
-指标看出问题之后动哪个旋钮，见[资源与调参](09-tuning-runbook.md)。
+指标看出问题之后该调哪一项，见[资源与调参](08-tuning-runbook.md)。
