@@ -287,6 +287,40 @@ cgroup OOMKilled           kube_pod_container_status_last_terminated_reason
 关掉 memory monitor 只是把前者变成后者
 ```
 
+## 这些指标画出来长什么样
+
+下面五张是一次真实作业的 Ray 看板截图，面板来自 head Pod 内的官方 Grafana JSON（导出方式见本页末尾）。贴在这里是为了让上表的指标名和实际曲线对上号——每张下面一句话说明**该盯哪一处**，不是图例说明。
+
+**逻辑资源：调度器以为的世界**
+
+![Logical CPU USED vs AVAILABLE 与 Logical object_store_memory by pod 面板](images/ray-logical-resources.png)
+
+对应 `ray_resources`。USED 顶到 AVAILABLE 走平顶，说明并行度被逻辑 CPU 封顶，这时加 partition 不会更快，要加 worker 或改 `num-cpus`。它是**调度器的账本，不是真实占用**，必须和下面那张对照着看。
+
+**CPU：真实利用率与 throttling**
+
+![Node CPU utilization、Cores in use、CPU throttling (cAdvisor) 面板](images/ray-cpu.png)
+
+最右侧的 throttling 最容易漏。逻辑 CPU 还有余量、节点利用率也不高，但 throttling 抬头，说明是 cgroup limit 掐住了——症状是莫名变慢，不是报错。
+
+**CPU by Ray component：时间花在谁身上**
+
+![按 Ray 组件与算子拆分的 CPU 占用面板](images/ray-cpu-by-component.png)
+
+能把消耗拆到算子级，图中可见 `PhysicalScan->Project->UDFProject->DataSink` 这样的完整链路。UDF 占大头就去调 [UDF](06-udf.md) 的并发与 batch；`gcs` / `dashboard` 占大头则是 head 被压，检查是不是把计算派到了 head 上。
+
+**内存：三条线要分开看**
+
+![Container memory usage vs limit、Memory/limit SLO、Memory growth per hour、Ray node memory and shared memory 面板](images/ray-memory.png)
+
+usage vs limit 判 OOMKilled 风险；growth per hour 判是否在累积——正常的流式作业应该走上平台期，持续爬坡意味着某处在攒数据；shared memory 单列是因为 `/dev/shm` 归 object store 用，不能和堆混在一起算。内存为什么要分池看，见[执行模型](02-execution-model.md)。
+
+**Object store 与 spilling**
+
+![Object store by Location（MMAP_DISK / MMAP_SHM / SPILLED / WORKER_HEAP）与 Spill rate 面板](images/ray-object-store-spill.png)
+
+`SPILLED` 一旦离开 0 就说明对象存储装不下、Ray 开始打盘，吞吐会显著下滑（这次截图里 SPILLED 累计到了 3.27 TiB，spill rate 全程二三十 MiB/s）。持续非零的 spill 是必须处理的信号，不是可以忍的背景噪声，处理顺序见[资源与调参](09-tuning-runbook.md)。
+
 ## Daft：OTLP push
 
 Daft 不开 `/metrics`。设任一 OTLP endpoint 即启用遥测。
