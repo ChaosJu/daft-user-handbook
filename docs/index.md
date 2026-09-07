@@ -8,7 +8,7 @@
 |---|---|
 | [1. 架构](01-architecture.md) | Flotilla / Swordfish、pipeline 而非 stage、算子分两类、三条部署硬约束、四个调参维度 |
 | [2. 执行模型](02-execution-model.md) | 惰性求值与触发执行、Runner、partition / morsel / batch、morsel 与 into_batches |
-| [3. KubeRay RayJob 部署](03-deploy-kuberay.md) | 装 operator、apply 清单、字段对照、失败判层 |
+| [3. KubeRay RayJob 部署](03-deploy-kuberay.md) | RayJob 原理、Quickstart 跑通、关键 YAML 字段 |
 | [4. Partition](04-partition.md) | task 数、scan 切分、shuffle 边界、into_batches 在 Ray 上的分区效应 |
 | [5. UDF](05-udf.md) | `@daft.func` / `.batch` / `@daft.cls`、`max_concurrency` 两种语义、actor 两个不等式 |
 | [6. 读写参数](06-io-config.md) | IOConfig、Parquet / Lance 读写、`download` 并发、`write_mode` |

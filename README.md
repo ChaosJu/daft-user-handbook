@@ -4,7 +4,7 @@
 
 本手册不是 API 百科，写的是生产共识。官方 API 以 [docs.daft.ai](https://docs.daft.ai) 为准。
 
-**从 [`docs/index.md`](docs/index.md) 开始读**，那里有十页导航和四条要先记住的规则。要直接在集群上跑，跳到 [KubeRay RayJob 部署](docs/03-deploy-kuberay.md)。
+**从 [`docs/index.md`](docs/index.md) 开始读**，那里有九页导航和四条要先记住的规则。要直接在集群上跑，从 [KubeRay RayJob 部署](docs/03-deploy-kuberay.md) + [`examples/quickstart/`](examples/quickstart/) 开始。
 
 ## 示例清单
 
@@ -34,7 +34,7 @@
 | `30-raycronjob.yaml` | 可选，每晚小规模回归 |
 | `40-raycluster.yaml` + `41-rayjob-existing.yaml` | 可选，常驻集群 + `clusterSelector`，调参用 |
 
-`20` 和 `40`+`41` 抢同一批节点，不要同时 apply。apply 前要改三处占位：MinIO 的 `nodeSelector`、镜像 registry、`REPLACE_WITH_DATA_RUN_ID`。步骤见 [KubeRay RayJob 部署](docs/03-deploy-kuberay.md)。
+`20` 和 `40`+`41` 抢同一批节点，不要同时 apply。Quickstart 验证链路见 [部署文档](docs/03-deploy-kuberay.md)；生产占位符与步骤见 [`examples/kuberay/README.md`](examples/kuberay/README.md)。
 
 ## 本地预览文档
 

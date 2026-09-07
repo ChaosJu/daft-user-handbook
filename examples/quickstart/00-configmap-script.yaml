@@ -12,7 +12,7 @@
 #    这里依赖在镜像里（见 ../docker/），直接 `python main.py` 就行。
 #
 # 2. 保留了 print(df.collect())。示例只有 6 行，看得见输出才好验证链路；
-#    生产必须以 write_* 收尾，理由见 docs/03-best-practices/production-donts.md。
+#    生产必须以 write_* 收尾，理由见 docs/09-production-donts.md。
 #
 # 挂载点是 /home/ray/samples/main.py：镜像以 ray 用户运行（HOME=/home/ray）。
 # ============================================================================
