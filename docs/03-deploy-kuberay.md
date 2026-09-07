@@ -287,7 +287,7 @@ Daft 自己的查询级观测在 `:3238`，和 Ray Dashboard 的 `:8265` 不是�
 kubectl -n daft-bench port-forward svc/daft-dashboard 3238:3238
 ```
 
-Daft Dashboard 做成独立 Deployment 而不是 head sidecar，在 RayJob 形态下是必须的——sidecar 会跟着集群一起被删，作业跑完就没 UI 可看了。完整的日志来源与指标接法见[日志与监控](07-observability.md)。
+Daft Dashboard 做成独立 Deployment 而不是 head sidecar，在 RayJob 形态下是必须的——sidecar 会跟着集群一起被删，作业跑完就没 UI 可看了。失败排障与关键指标见[日志与监控](07-observability.md)。
 
 ## 步骤 6 · 回收
 

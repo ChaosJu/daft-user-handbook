@@ -12,7 +12,7 @@
 | [4. Partition](04-partition.md) | task 数、scan 切分、shuffle 边界、into_batches 在 Ray 上的分区效应 |
 | [5. UDF](05-udf.md) | `@daft.func` / `.batch` / `@daft.cls`、`max_concurrency` 两种语义、actor 两个不等式 |
 | [6. 读写参数](06-io-config.md) | IOConfig、Parquet / Lance 读写、`download` 并发、`write_mode` |
-| [7. 日志与监控](07-observability.md) | 四层观测、Ray 日志到底在哪、指标怎么接出来 |
+| [7. 日志与监控](07-observability.md) | 失败怎么查日志、关键指标与看板截图 |
 | [8. 资源与调参](08-tuning-runbook.md) | worker 规格、内存预算、morsel 调参、症状 → 动作 |
 | [9. 生产禁区](09-production-donts.md) | 上线前逐条勾的门禁清单 |
 

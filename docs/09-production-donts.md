@@ -86,7 +86,7 @@
 | #   | 禁止                   | 为什么                                                                                                 |
 | --- | -------------------- | --------------------------------------------------------------------------------------------------- |
 | 32  | 只靠 `kubectl logs` 排障 | 它只覆盖容器 stdout，Ray 现场在 `/tmp/ray`                                                                    |
-| 33  | `/tmp/ray` 没有日志持久化   | Pod 一重建或 TTL 一到，driver / UDF / raylet / GCS 日志全没。用 Fluent Bit sidecar，见[日志与监控](07-observability.md) |
+| 33  | `/tmp/ray` 没有日志留存 | Pod 一重建或 TTL 一到，driver / UDF / raylet 日志全没。失败时先 `kubectl cp` / `ray job logs` 带走；长期留存由平台 sidecar 接日志系统 |
 
 
 
