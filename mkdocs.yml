@@ -27,8 +27,14 @@ markdown_extensions:
   - tables
   - toc:
       permalink: true
+      # 默认 slugify 会丢掉中文，标题锚点退化成 _2 / _3 这类自动编号，
+      # 增删标题就会漂移。用 pymdownx 的 slugify 保留中文，锚点才稳定。
+      slugify: !!python/object/apply:pymdownx.slugs.slugify {kwds: {case: lower}}
+validation:
+  anchors: warn
 nav:
   - 首页: index.md
+  - 0. 速查一页: 00-cheatsheet.md
   - 1. 架构: 01-architecture.md
   - 2. 执行模型: 02-execution-model.md
   - 3. KubeRay RayJob 部署: 03-deploy-kuberay.md

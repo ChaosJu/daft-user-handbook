@@ -49,7 +49,7 @@ class Embedder:
 
 | 参数 | 作用 | 要点 |
 |---|---|---|
-| `cpus` / `gpus` | 每实例资源需求 | 只影响放置：8 CPU 机器 + `cpus=4` → 最多 2 个实例 |
+| `cpus` / `gpus` | 每实例资源需求 | 只影响放置：8 CPU 机器 + `cpus=4` → 最多 2 个实例。`cpus` 不写按 **1.0** 提给 Ray，不是 0 |
 | `max_concurrency` | **同步 = actor 进程数；async = 协程并发数** | 同名两种语义，最容易配错 |
 | `batch_size` | 单批最大行数，仅 batch API | 上限不是保证值，上游 morsel 更小就填不满（见[执行模型](02-execution-model.md)） |
 | `use_process` | 每实例独立进程 | 不设时引擎自选；绕 GIL、隔离 native 崩溃 |
@@ -68,7 +68,7 @@ class Embedder:
 ```text
 同步 Class UDF   daft.cls(cpus=C, max_concurrency=N)
   → 全集群最多 N 个并行 UDF 实例 = N 个常驻 actor
-  → 占用 CPU = N × C，可以直接乘出来
+  → 占用 CPU = N × C，可以直接乘出来（C 缺省为 1.0，不是 0）
 
 异步 Class / async func   max_concurrency=N
   → N 是每个 class worker 内的并发协程数
@@ -112,9 +112,13 @@ actor 资源大于 worker 资源时，Ray 不会报一个响亮的“配错了�
 CPU 算出来能放 4 个、内存只够放 2 个 → **以内存为准**。按 CPU 排满的结果就是 worker 被 OOMKilled，actor 反复重启到耗尽次数，作业挂。
 
 ```text
-actor 数 = min(按 CPU 能放的, 按内存能放的)
+actor 数 = min(按 GPU 能放的, 按 CPU 能放的, 按内存能放的)
 然后至少再留 1～2 核给 I/O 和 Ray
 ```
+
+`max_concurrency` 超过这个值不会报错。Daft 用集群总量算 `int(min(总CPU ÷ cpus, 总GPU ÷ gpus))`，超了只打一条 warning（日志搜 `only ... actors can be scheduled`），提交全部 actor，多出来的那几个停在 `PENDING_CREATION`，然后**等满 `actor_udf_ready_timeout` 才带着已就绪的部分继续跑**。默认 120 秒的空转很容易被当成"Daft 慢"。
+
+这个预检查用的是集群总量，不看碎片。26 核拆成 2×13 节点、`cpus=2` 时，公式给出 13，但 SPREAD 之后每节点只放得下 6 个，实际就绪 12 个。
 
 ## UDF 的 `batch_size` 与上游 morsel
 

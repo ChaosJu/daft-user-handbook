@@ -15,7 +15,7 @@
 | 4   | 流水线中途 `to_pandas()`                                             | 聚合、join、过滤留在 Daft 里做             |
 | 5   | 把 `show()` 当成巨大计划的免费探活                                          | 它会启动执行                           |
 | 6   | 用中途 `count()` / `count_rows()` 当进度条                             | 跑完整计划只为一个数。进度看 Dashboard 或阶段日志   |
-| 7   | 未确认体积就 `to_torch()` / `to_ray_dataset()`                        | 这些 API 会物化，先 `limit` 或写中间集       |
+| 7   | 未确认体积就 `to_torch_*()` / `to_ray_dataset()` / `to_dask_dataframe()` | 这些 API 会物化，先 `limit` 或写中间集       |
 
 
 合法的生产终点只有 `write_parquet` / `write_lance` / `write_iceberg` / `write_csv` / `write_json`，以及带 checkpoint 的 map-only 链路。`collect()` 只允许在结果确定装得进 driver 的冒烟或聚合后小表上。触发执行清单见[执行模型](02-execution-model.md)。

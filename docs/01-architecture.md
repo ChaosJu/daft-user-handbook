@@ -88,7 +88,7 @@ Execution     把物理计划翻译成 pipeline
 下游背压 → channel 满 → 上游阻塞
 ```
 
-峰值内存因此与数据总量脱钩，只取决于**在途 morsel**：并发 task × 在途 morsel 数 × 单行实际体积。数据总量翻十倍，只要在途量不变，峰值可以不变。
+峰值内存因此与数据总量脱钩，只取决于**同一时刻在途的 morsel**：并发 task 数 × 每 task 在途 morsel 数 × 每行实际大小。数据总量翻十倍，只要同时在处理的量不变，峰值内存可以不变。
 
 `morsel` 配的是**行数，不是字节**。URL 列只有几十字节，下载解码之后可能是几 MB。同一个 morsel 行数在 scan 与 decode 之后可以差三个数量级。`default_morsel_size` 与 `into_batches` 的对比和传播机制见[执行模型](02-execution-model.md)。
 
@@ -201,7 +201,19 @@ Ray 调度只读 num-cpus，真正的约束是 cgroup
 | **batch_size** | UDF | 单次推理的样本数 | 模型吞吐不足 | 单批内存峰值上升 |
 | **max_concurrency** | UDF | 常驻实例数 / 协程并发 | 资源利用不足 | OOM、排队、下游限流 |
 
-四个数字相乘才是在途字节。只改其中一个、不看乘积，就会出现"我已经把 morsel 调小了还是 OOM"——因为 actor 数或 `download(max_connections=32)` 把并发乘回去了。
+四个维度不直接相乘，它们各自落在三个因子上，真正相乘的是这三个：
+
+```text
+在途数据占的内存 ≈ 同时在处理的批数 × 每批行数 × 每行实际大小
+
+同时在处理的批数   每节点并发 task 数（partition 定上限）× UDF 实例数（max_concurrency）
+每批行数           min(default_morsel_size, into_batches(n), UDF batch_size)
+每行实际大小       download / decode / 推理之后的真实字节
+```
+
+`morsel` 与 `batch_size` 同为行数，后者是前者的再切分，因此**取小而不是相乘**。把行数换成字节的是"每行实际大小"，它不由任何参数控制，只能从数据形态估——这也是同一套参数在窄表上没事、在图像链路上 OOM 的原因。
+
+只改其中一个因子、不看乘积，就会出现"我已经把 morsel 调小了还是 OOM"——因为 actor 数或 `download(max_connections=32)` 把并发乘回去了。
 
 ## 这一页推出来的结论
 

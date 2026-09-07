@@ -24,7 +24,7 @@ flowchart LR
 | `collect()` | 执行完整计划并物化全部结果 | **大结果禁止** |
 | `count_rows()` / `count()` | 跑完整计划只为得到一个数 | 中途当"进度检查"会重跑整图 |
 | `to_pydict()` / `to_arrow()` / `to_pandas()` | 把结果拉到调用方进程 | **大结果禁止** |
-| `to_torch()` / `to_ray_dataset()` | 物化后交给下游框架 | 确认体积后再用 |
+| `to_torch_map_dataset()` / `to_torch_iter_dataset()` / `to_torch_dataloader()` / `to_ray_dataset()` / `to_dask_dataframe()` | 物化后交给下游框架 | 确认体积后再用 |
 | `write_parquet()` / `write_lance()` / `write_iceberg()` / `write_csv()` / `write_json()` | 执行并把数据落到外部存储 | **生产默认终点** |
 
 不要为了"让前一步先跑"而在每个步骤后调用 `collect()`。这会切断优化机会、增加物化和内存压力。应尽量构建完整计划，最后统一写出。
@@ -171,7 +171,7 @@ df = (
 
 动态批默认关闭。生产先把静态 morsel 跑稳，再评估 `enable_dynamic_batching`，不要两件事一起开。
 
-四个数字相乘才是在途字节——partition × morsel × UDF `batch_size` × `max_concurrency`。`download(max_connections)` 默认 32 且会顶掉 `S3Config`，见[读写参数](06-io-config.md)。按行形态选起点、何时增减、操作顺序见[资源与调参](08-tuning-runbook.md)。
+在途数据占的内存 ≈ 同时在处理的批数 × 每批行数 × 每行实际大小。partition 与 `max_concurrency` 决定"同时在处理的批数"，morsel 与 UDF `batch_size` 同为行数、**取小**决定"每批行数"，完整拆解见[架构](01-architecture.md)。`download(max_connections)` 默认 32 且会顶掉 `S3Config`，见[读写参数](06-io-config.md)。按行形态选起点、何时增减、操作顺序见[资源与调参](08-tuning-runbook.md)。
 
 ## 5. 内存由多个资源池共同构成
 

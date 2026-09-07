@@ -4,8 +4,11 @@
 
 九页，按阅读顺序编号。每个事实只在一页里展开，其余地方只留链接。
 
+赶时间就只看 **[速查一页](00-cheatsheet.md)**——它把结论、默认值陷阱、症状对照和上线清单压在一页里，覆盖日常九成的问题，推导仍留在下面九页。
+
 | 页 | 回答什么 |
 |---|---|
+| [0. 速查一页](00-cheatsheet.md) | 十条铁律、为什么不能 `collect`、分区怎么用、morsel 起点、症状 → 动作、上线清单 |
 | [1. 架构](01-architecture.md) | Flotilla / Swordfish、pipeline 而非 stage、算子分两类、三条部署硬约束、四个调参维度 |
 | [2. 执行模型](02-execution-model.md) | 惰性求值与触发执行、Runner、partition / morsel / batch、morsel 与 into_batches |
 | [3. KubeRay RayJob 部署](03-deploy-kuberay.md) | RayJob 原理、Quickstart 跑通、关键 YAML 字段 |
