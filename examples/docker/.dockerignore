@@ -1,0 +1,5 @@
+README.md
+build.sh
+import-to-k3s.sh
+*.tar
+.git

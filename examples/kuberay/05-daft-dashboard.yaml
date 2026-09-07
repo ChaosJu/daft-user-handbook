@@ -1,0 +1,91 @@
+# ============================================================================
+# Daft Dashboard —— Daft 查询级可观测（端口 3238）。
+#
+# 与 head 上 :8265 的 Ray Dashboard 是两个东西：
+#   8265 → Ray 的 Jobs / Actors / Nodes / 资源
+#   3238 → Daft 的查询计划、算子进度、分区级执行统计
+# 压测时建议两个都开。
+#
+# 为什么是独立 Deployment 而不是 head sidecar：
+#   - dashboard 是被动接收端（Daft 主动 push 事件给它），不需要和 Ray 同 Pod，
+#     只要 driver（head）和 worker actor 能路由到它；
+#   - head 只有 2C/4Gi 且要扛 GCS + Jobs API，不该再塞进程；
+#   - RayJob 形态下这一条是决定性的：shutdownAfterJobFinishes 会删掉整个
+#     RayCluster，sidecar 会跟着消失，作业跑完就没有 UI 可看了。
+#     独立 Deployment 活在 RayJob 的生命周期之外，跑完还能回看执行图，
+#     也能跨多次 run 对比。
+#
+# 谁需要 DAFT_DASHBOARD_URL：只有 Ray Job 的 driver（跑在 head 上）。Daft 会通过
+# runtime_env 把它传给 scheduler actor 和 worker actor。这里仍然写进
+# 00-platform.yaml 的 bench-env（head 与 worker 都 envFrom 它），是为了不依赖
+# 那条传播链，且与其余集群环境变量同源。
+#
+# 编号 05：先于 20-rayjob.yaml apply，这样 head 起来时 Service DNS 已存在。
+# 不 apply 也没关系——dashboard 不可达时 Daft 只打 warning 并丢弃事件，
+# benchmark 照常跑完（因此 20-rayjob.yaml 里 wait.py 只探 minio 和 mock，
+# 没有把 dashboard 设成门禁）。
+#
+# 已知限制：
+#   - 状态只在内存，Pod 重启后历史查询丢失，没有持久化选项；
+#   - 无鉴权，保持 ClusterIP，用 port-forward 访问，不要配 Ingress 暴露；
+#   - Daft 与 dashboard 之间的协议跨版本不稳定，必须与 head/worker 同镜像。
+#
+# 部署与访问：
+#   kubectl apply -f examples/kuberay/05-daft-dashboard.yaml
+#   kubectl -n daft-bench port-forward svc/daft-dashboard 3238:3238
+# ============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: daft-dashboard
+  namespace: daft-bench
+  labels:
+    app.kubernetes.io/name: daft-audio-bench
+    app.kubernetes.io/component: daft-dashboard
+    app: daft-dashboard
+spec:
+  replicas: 1
+  # 单实例内存态接收端：Service 后面绝不能有两个 Pod，否则同一次查询的事件
+  # 会被轮询打散到不同副本，UI 上看到的就是残缺的执行图。
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: daft-dashboard }
+  template:
+    metadata:
+      labels: { app: daft-dashboard }
+    spec:
+      # imagePullSecrets:
+      #   - name: offline-registry
+      containers:
+        - name: dashboard
+          # 与 head / worker 同镜像：协议跨版本不稳定，dashboard 必须和上报
+          # 事件的脚本是同一个 daft 版本。
+          image: daft-audio:offline
+          imagePullPolicy: IfNotPresent
+          # 绝对 venv 路径，与 submitter 一致：PATH 被重置时会选中裸的
+          # /usr/local/bin/daft（不存在）。
+          # 前台运行（不加 --daemon），让容器进程就是 dashboard 本身。
+          command: ["/opt/venv/bin/daft", "dashboard", "start", "-a", "0.0.0.0", "-p", "3238"]
+          ports:
+            - { containerPort: 3238, name: http }
+          readinessProbe:
+            httpGet: { path: /api/ping, port: 3238 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            # 只存查询元数据，不参与计算。内存随保留的查询数增长，长时间压测
+            # 会话被 OOMKilled 时上调 limit。
+            requests: { cpu: "200m", memory: "512Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: daft-dashboard
+  namespace: daft-bench
+spec:
+  # ClusterIP：无鉴权服务不对外暴露。
+  selector: { app: daft-dashboard }
+  ports:
+    - { name: http, port: 3238, targetPort: 3238 }

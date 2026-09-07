@@ -1,0 +1,10 @@
+# Pin for reproducible builds. Bump after testing on your Ray version.
+#
+# IMPORTANT: Do NOT use daft[ray] here. The base rayproject/ray image already
+# ships Ray; the [ray] extra would pip-install another Ray and break KubeRay
+# version alignment (rayVersion / image tag / GCS protocol must match).
+daft[aws,lance,pandas]==0.7.24
+
+# Ops / I/O helpers (lightweight; daft[aws] already pulls boto3)
+s3fs>=2024.6.0
+awscli>=1.32.0,<2

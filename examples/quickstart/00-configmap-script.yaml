@@ -1,0 +1,59 @@
+# ============================================================================
+# 官方 Daft 示例脚本（逐字照抄）
+#
+# 来源：https://docs.daft.ai/en/stable/distributed/kubernetes/
+#       "Running on Kubernetes" → Distributed Mode
+#
+# main.py 的内容与官方文档**一字不改**，包括 print(df.collect())。
+# 这是刻意的：这套示例的用途就是"官方怎么写的，在 RayJob 里也照样能跑"。
+# 生产不该这么写，为什么见 README.md 的"三处和生产禁区冲突的地方"。
+#
+# 三个细节值得看懂，它们决定了 10-rayjob.yaml 为什么能不带自建镜像就跑起来：
+#
+# 1. 开头那个 `# /// script` 块是 PEP 723 内联依赖声明。
+#    `uv run --script main.py` 会读它，临时建一个装好 daft 的 venv。
+#    所以 driver 端的 daft 是运行时装的，镜像里不需要有。
+#    Ray 2.45 起 rayproject/ray 镜像自带 uv，这条路才走得通。
+#
+# 2. `ray[client]==2.46.0` 必须和镜像里的 Ray 版本一致。
+#    uv 建的 venv 是隔离的，不会复用镜像里的 ray；版本不一致连不上 GCS。
+#    换镜像 tag 就要同步改这里，和 10-rayjob.yaml 的 rayVersion 三处对齐。
+#
+# 3. `ray.init(runtime_env={"pip": ["daft"]})` 负责把 daft 送到 **worker**。
+#    第 1 条只解决 driver。这也是为什么 10-rayjob.yaml 里
+#    **不能**再设 runtimeEnvYAML —— 两处都声明 runtime_env 会冲突。
+#
+# 挂载点是 /home/ray/samples/main.py：rayproject/ray 镜像以 ray 用户
+# （HOME=/home/ray）运行，放在 HOME 下面权限最省事。
+# ============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: daft-quickstart
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: daft-quickstart-script
+  namespace: daft-quickstart
+  labels:
+    app.kubernetes.io/name: daft-quickstart
+data:
+  main.py: |
+    # /// script
+    # dependencies = ["daft", "ray[client]==2.46.0"]
+    # ///
+
+    import daft
+    import ray
+
+    ray.init(runtime_env={"pip": ["daft"]})
+
+    df = daft.from_pydict({
+        "a": [3, 2, 5, 6, 1, 4],
+        "b": [True, False, False, True, True, False]
+    })
+
+    df = df.where(df["b"]).sort(df["a"])
+
+    print(df.collect())

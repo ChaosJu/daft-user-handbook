@@ -1,0 +1,128 @@
+# ============================================================================
+# RayJob —— daft-ray-ops 自建镜像 + baked 示例脚本
+#
+# 和 ../kuberay/20-rayjob.yaml 是同一种形态（RayJob + 临时集群）。
+# 镜像见 ../docker/（Daft + top/ps/netstat 等运维 CLI 已烤进镜像）。
+#
+# 前置条件：
+#   - KubeRay operator + CRD
+#   - 已构建并导入 daft-ray-ops:2.55.1（见 ../docker/README.md）
+#   - 已 apply 00-configmap-script-baked.yaml
+#
+# 若需对照官方「运行时装 daft」形态，见 00-configmap-script.yaml + git 历史。
+# ============================================================================
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: daft-quickstart
+  namespace: daft-quickstart
+  labels:
+    app.kubernetes.io/name: daft-quickstart
+    app.kubernetes.io/component: rayjob
+spec:
+  entrypoint: python /home/ray/samples/main.py
+
+  shutdownAfterJobFinishes: true
+  # 60s 够 kubectl logs 捞完输出。示例没有产物要落盘，不用留久。
+  ttlSecondsAfterFinished: 60
+  activeDeadlineSeconds: 300
+  # 5min 还没进 Running 就是集群起不来（镜像拉不动、Kind 内存不够）。
+  # 失败时看 .status.reason 会是 PreRunningDeadlineExceeded。
+  preRunningDeadlineSeconds: 300
+  submissionMode: K8sJobMode
+  backoffLimit: 0
+
+  # 不设 submitterPodTemplate。这套没有 MinIO / mock-llm 之类的外部依赖要探，
+  # KubeRay 默认的提交器就够了 —— 这也正好是 RayJob 的最小形态。
+  # ../kuberay/20-rayjob.yaml 之所以要自定义提交器，是为了插 wait-deps。
+
+  # --------------------------------------------------------------------------
+  # 集群规格。按 Kind / 单机能排下来配，不是生产规格。
+  # --------------------------------------------------------------------------
+  rayClusterSpec:
+    rayVersion: "2.55.1"
+    enableInTreeAutoscaling: false
+
+    headGroupSpec:
+      serviceType: ClusterIP
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+        # head 不参与调度：Daft 的 task 只落到 worker 上。
+        # 官方 chart 的 head 也是 --num-cpus=0。
+        num-cpus: "0"
+        disable-usage-stats: "true"
+        metrics-export-port: "8080"
+      template:
+        metadata:
+          labels:
+            app: daft-quickstart-head
+        spec:
+          containers:
+            - name: ray-head
+              image: daft-ray-ops:2.55.1
+              imagePullPolicy: IfNotPresent
+              ports:
+                - { containerPort: 6379, name: gcs }
+                - { containerPort: 8265, name: dashboard }
+                - { containerPort: 10001, name: client }
+                - { containerPort: 8080, name: metrics }
+              resources:
+                # request == limit。KubeRay 按 **limits** 上报资源，
+                # memory request 会被忽略 —— 官方 chart 只写 requests.cpu
+                # 是因为它不经过 KubeRay，这里必须写全。
+                requests: { cpu: "1", memory: "2Gi" }
+                limits: { cpu: "1", memory: "2Gi" }
+              volumeMounts:
+                # 官方示例脚本。ConfigMap 挂进来是只读的，uv 不往这儿写东西
+                # （它的缓存在 ~/.cache/uv），所以没问题。
+                - { name: script, mountPath: /home/ray/samples }
+                - { name: ray-logs, mountPath: /tmp/ray }
+              readinessProbe:
+                httpGet: { path: /api/version, port: 8265 }
+                initialDelaySeconds: 10
+                periodSeconds: 5
+                failureThreshold: 30
+          volumes:
+            - name: script
+              configMap:
+                name: daft-quickstart-baked-script
+                items:
+                  - { key: main.py, path: main.py }
+            - name: ray-logs
+              emptyDir: {}
+
+    workerGroupSpecs:
+      - groupName: daft-workers
+        # 1 个 worker 就能验证链路。三者必须一致（关了 autoscaling 时
+        # KubeRay 会把 replicas 夹到 [min, max]）。
+        replicas: 1
+        minReplicas: 1
+        maxReplicas: 1
+        rayStartParams:
+          # 必须等于 resources.limits.cpu。
+          num-cpus: "2"
+          disable-usage-stats: "true"
+          metrics-export-port: "8080"
+        template:
+          metadata:
+            labels:
+              app: daft-quickstart-worker
+          spec:
+            containers:
+              - name: ray-worker
+                image: daft-ray-ops:2.55.1
+                imagePullPolicy: IfNotPresent
+                ports:
+                  - { containerPort: 8080, name: metrics }
+                resources:
+                  requests: { cpu: "2", memory: "4Gi" }
+                  limits: { cpu: "2", memory: "4Gi" }
+                volumeMounts:
+                  # 不显式挂 /dev/shm，用 KubeRay 1.6.2 的自动注入
+                  # （emptyDir.medium: Memory，sizeLimit = memory limit）。
+                  # 示例数据只有 6 行，Plasma 用默认的约 30% 就够。
+                  # 胖行场景为什么必须手动压 shm，见 ../kuberay/20-rayjob.yaml。
+                  - { name: ray-logs, mountPath: /tmp/ray }
+            volumes:
+              - name: ray-logs
+                emptyDir: {}

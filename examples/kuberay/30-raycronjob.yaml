@@ -1,0 +1,206 @@
+# ============================================================================
+# RayCronJob —— 定时回归（可选）
+#
+# RayJob 改造完之后顺带拿到的能力：spec.jobTemplate 的类型就是 RayJobSpec，
+# 所以 20-rayjob.yaml 的 spec 原样贴进来就能定时跑。常驻 RayCluster +
+# 外部 submit Job 的老形态做不到这件事，得自己写 CronJob 去调 Jobs API。
+#
+# 前置检查（v1.6 新增的类型，老 operator 上没有）：
+#   kubectl get crd raycronjobs.ray.io
+# 没有就先升级 KubeRay，或者退回用 K8s CronJob 定时 `kubectl create -f`。
+#
+# 为什么 cron 场景是安全的：run-bench.sh 的第二个参数传 auto，
+# 每次按 UTC 时间生成新的 RUN_ID，产物写到
+# s3://benchmark/audio/<RUN_ID>/，不会互相覆盖。
+# 反过来说：如果把 RUN_ID 写死，定时任务会每天覆盖同一份 Lance 和报表。
+#
+# 输入数据集是复用的（DATA_RUN_ID 固定），所以定时任务不需要重跑
+# 10-generate-job.yaml。
+#
+# 这里的集群规格故意比 20-rayjob.yaml 小（2 worker 而不是 10）：
+# 每晚回归要的是"还能跑通、吞吐没掉一个数量级"，不是满负载压测。
+# 满负载压测按需手动 apply 20-rayjob.yaml。
+#
+# RayCronJobSpec 只有 schedule / jobTemplate / suspend 三个字段，
+# 没有 concurrencyPolicy 和 startingDeadlineSeconds。想临时停掉：
+#   kubectl patch raycronjob daft-audio-nightly -n daft-bench \
+#     --type=merge -p '{"spec":{"suspend":true}}'
+#
+# apply 前必做：把 REPLACE_WITH_DATA_RUN_ID 换成 GEN_RUN_ID
+# ============================================================================
+apiVersion: ray.io/v1
+kind: RayCronJob
+metadata:
+  name: daft-audio-nightly
+  namespace: daft-bench
+  labels:
+    app.kubernetes.io/name: daft-audio-bench
+    app.kubernetes.io/component: raycronjob
+spec:
+  # 每天 UTC 18:00。cron 表达式按 operator 所在时区解释，
+  # 别按本地时间脑补。
+  schedule: "0 18 * * *"
+  suspend: false
+  # 以下就是一份完整的 RayJobSpec，字段语义与 20-rayjob.yaml 完全一致，
+  # 只解释与那份不同的地方。
+  jobTemplate:
+    # 回归的规模由**数据集**决定，不是命令行 —— `benchmark.audio run`
+    # 没有 --limit / --count 之类的截断参数（见 benchmark/audio/cli.py
+    # 的 _add_run_arguments）。所以先单独生成一份小数据集：
+    #   把 10-generate-job.yaml 的 GEN_COUNT 改成 500，
+    #   job 名改成 bench-generate-nightly，apply 一次，
+    #   把它打印的 GEN_RUN_ID 填到下面。
+    # 把这里指向 10k 那份大数据集，等于每晚跑一次满负载压测。
+    #
+    # actor 并发 4 对应下面 2 worker × num-cpus 2 = 4 个 Ray CPU。
+    entrypoint: >-
+      /bin/bash /scripts/run-bench.sh
+      REPLACE_WITH_DATA_RUN_ID
+      auto
+      --mock-url http://mock-llm:8010
+      --ray-address auto
+      --max-minutes 60
+      --num-partitions 8
+      --asr-actor-cpus 1
+      --asr-actor-concurrency 4
+      --asr-batch-size 1
+      --llm-concurrency 4
+
+    shutdownAfterJobFinishes: true
+    # 定时任务没人守着看日志，产物已经在 S3，集群立刻回收。
+    ttlSecondsAfterFinished: 60
+    # 小样本回归，1h 足够；跑超了就是真出问题了。
+    activeDeadlineSeconds: 3600
+    # 夜间集群资源紧张时不要挂着等，10min 起不来就失败告警。
+    preRunningDeadlineSeconds: 600
+    submissionMode: K8sJobMode
+    backoffLimit: 0
+    submitterConfig:
+      backoffLimit: 2
+
+    submitterPodTemplate:
+      metadata:
+        labels:
+          app: daft-audio-nightly-submitter
+        annotations:
+          kubectl.kubernetes.io/default-container: ray-job-submitter
+      spec:
+        restartPolicy: Never
+        # imagePullSecrets:
+        #   - name: offline-registry
+        initContainers:
+          - name: wait-deps
+            image: daft-audio:offline
+            imagePullPolicy: IfNotPresent
+            command: ["/opt/venv/bin/python", "/scripts/wait.py", "minio", "mock"]
+            volumeMounts:
+              - { name: scripts, mountPath: /scripts }
+        containers:
+          - name: ray-job-submitter
+            image: daft-audio:offline
+            imagePullPolicy: IfNotPresent
+            resources:
+              requests: { cpu: "500m", memory: "1Gi" }
+              limits: { cpu: "1", memory: "2Gi" }
+        volumes:
+          - name: scripts
+            configMap: { name: bench-scripts }
+
+    rayClusterSpec:
+      rayVersion: "2.55.1"
+      enableInTreeAutoscaling: false
+
+      headGroupSpec:
+        serviceType: ClusterIP
+        rayStartParams:
+          dashboard-host: "0.0.0.0"
+          num-cpus: "0"
+          disable-usage-stats: "true"
+          metrics-export-port: "8080"
+        template:
+          metadata:
+            labels:
+              app: daft-audio-nightly-head
+            annotations:
+              cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+          spec:
+            # imagePullSecrets:
+            #   - name: offline-registry
+            containers:
+              - name: ray-head
+                image: daft-audio:offline
+                imagePullPolicy: IfNotPresent
+                ports:
+                  - { containerPort: 6379, name: gcs }
+                  - { containerPort: 8265, name: dashboard }
+                  - { containerPort: 10001, name: client }
+                  - { containerPort: 8080, name: metrics }
+                envFrom:
+                  - configMapRef: { name: bench-env }
+                  - secretRef: { name: minio-creds }
+                resources:
+                  requests: { cpu: "2", memory: "4Gi" }
+                  limits: { cpu: "2", memory: "4Gi" }
+                volumeMounts:
+                  - { name: out, mountPath: /out }
+                  - { name: ray-logs, mountPath: /tmp/ray }
+                  - { name: scripts, mountPath: /scripts }
+                readinessProbe:
+                  httpGet: { path: /api/version, port: 8265 }
+                  initialDelaySeconds: 15
+                  periodSeconds: 5
+                  failureThreshold: 30
+            volumes:
+              - name: out
+                emptyDir: {}
+              - name: ray-logs
+                emptyDir: {}
+              - name: scripts
+                configMap: { name: bench-scripts }
+
+      workerGroupSpecs:
+        - groupName: asr-workers
+          # 回归规模：2 × 2 CPU = 4 个 Ray CPU，对应上面
+          # --asr-actor-concurrency 4。
+          replicas: 2
+          minReplicas: 2
+          maxReplicas: 2
+          rayStartParams:
+            num-cpus: "2"
+            object-store-memory: "2147483648"
+            disable-usage-stats: "true"
+            metrics-export-port: "8080"
+          template:
+            metadata:
+              labels:
+                app: daft-audio-nightly-worker
+            spec:
+              # imagePullSecrets:
+              #   - name: offline-registry
+              topologySpreadConstraints:
+                - maxSkew: 1
+                  topologyKey: kubernetes.io/hostname
+                  whenUnsatisfiable: ScheduleAnyway
+                  labelSelector:
+                    matchLabels:
+                      app: daft-audio-nightly-worker
+              containers:
+                - name: ray-worker
+                  image: daft-audio:offline
+                  imagePullPolicy: IfNotPresent
+                  envFrom:
+                    - configMapRef: { name: bench-env }
+                    - secretRef: { name: minio-creds }
+                  ports:
+                    - { containerPort: 8080, name: metrics }
+                  resources:
+                    requests: { cpu: "2", memory: "10Gi" }
+                    limits: { cpu: "2", memory: "10Gi" }
+                  volumeMounts:
+                    - { name: dshm, mountPath: /dev/shm }
+                    - { name: ray-logs, mountPath: /tmp/ray }
+              volumes:
+                - name: dshm
+                  emptyDir: { medium: Memory, sizeLimit: 3Gi }
+                - name: ray-logs
+                  emptyDir: {}

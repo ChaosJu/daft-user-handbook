@@ -1,0 +1,47 @@
+site_name: Daft 用户指导手册
+site_description: 面向生产使用的 Daft on Ray 架构、原理、最佳实践与运维调参手册
+theme:
+  name: material
+  language: zh
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.highlight
+    - content.code.copy
+    - toc.follow
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
+nav:
+  - 首页: index.md
+  - 1. 架构介绍:
+      - Daft on Ray 架构: 01-architecture/index.md
+  - 2. 基本原理:
+      - 原理总览: 02-principles/index.md
+      - Morsel 驱动的流式执行: 02-principles/morsel.md
+  - 3. 最佳实践:
+      - 实践总览: 03-best-practices/index.md
+      - KubeRay 部署: 03-best-practices/deploy-kuberay.md
+      - RayJob 实战: 03-best-practices/rayjob-hands-on.md
+      - Partition: 03-best-practices/partition.md
+      - Batch 与 Morsel: 03-best-practices/batch.md
+      - UDF: 03-best-practices/udf.md
+      - 读写参数配置: 03-best-practices/io-config.md
+      - 生产禁区: 03-best-practices/production-donts.md
+  - 4. 日志、监控与调参:
+      - 观测总览: 04-observability/index.md
+      - 如何看日志: 04-observability/logs.md
+      - 如何看监控: 04-observability/monitoring.md
+      - 根据监控调参: 04-observability/tune-from-metrics.md
+      - 资源怎么设: 04-observability/resource-sizing.md

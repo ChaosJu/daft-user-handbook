@@ -1,0 +1,360 @@
+# ============================================================================
+# 平台依赖（RayJob 形态）
+#
+# 由原 deploy/k8s/kuberay/00-platform.yaml 改造。内容：
+#   Namespace  daft-bench
+#   Secret     minio-creds
+#   ConfigMap  bench-env      Ray head / worker 通过 envFrom 注入
+#   ConfigMap  bench-scripts  wait.py / run-bench.sh / publish-artifacts.py
+#   MinIO      集群内 S3（节点本地 hostPath）
+#   Mock LLM   serve-mock，profile standard
+#
+# 常驻层：apply 一次，反复跑 RayJob 都不用动。
+#
+# 相对原版的三处改造（原因都是 RayJob 的集群名是动态的）：
+#   1. wait.py 去掉 ray / dashboard 两个探针
+#      KubeRay 在提交前已经等 RayCluster ready，且 head Service 名是
+#      <rayjob>-<random>-head-svc，写死 daft-audio-head-svc 永远探不到
+#   2. NO_PROXY 去掉 daft-audio-head-svc，靠 .svc / .svc.cluster.local 覆盖
+#   3. 新增 run-bench.sh + publish-artifacts.py
+#      RayJob 跑完会删 head Pod，产物必须在 driver 退出前推到 MinIO
+#
+# apply 前必做：
+#   1. 把 REPLACE_WITH_NODE_NAME 换成有大容量 /data 的节点名
+#   2. 镜像换成你的离线 registry 路径（daft-audio:offline）
+#   3. MinIO 钉死具体 tag，不要用 latest
+# ============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: daft-bench
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-creds
+  namespace: daft-bench
+type: Opaque
+stringData:
+  MINIO_ROOT_USER: "minioadmin"
+  MINIO_ROOT_PASSWORD: "minioadmin"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bench-env
+  namespace: daft-bench
+data:
+  # head 与 worker 都通过 envFrom 拿这一份（见 20-rayjob.yaml）。
+  # 这里不配 /dev/shm 和 Plasma：前者由 KubeRay 注入或清单显式挂载，
+  # 后者是 rayStartParams.object-store-memory。
+  # 注意 VAD_MODEL 留空不等于关闭 VAD —— FunASR 会把 "" 当成 model id。
+  MINIO_ENDPOINT: "http://minio:9000"
+  MINIO_REGION: "us-east-1"
+  ASR_DEVICE: "cpu"
+  ASR_MODEL: "/opt/models/modelscope/models/iic/SenseVoiceSmall"
+  VAD_MODEL: "/opt/models/modelscope/models/iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"
+  MODELSCOPE_CACHE: "/opt/models/modelscope"
+  HF_HOME: "/opt/models/hf"
+  HF_HUB_OFFLINE: "1"
+  TRANSFORMERS_OFFLINE: "1"
+  RAY_USAGE_STATS_ENABLED: "0"
+  # Ray Dashboard 里显示容器视角的磁盘用量，而不是宿主机。
+  RAY_DASHBOARD_ENABLE_K8S_DISK_USAGE: "1"
+  # Daft Dashboard（05-daft-dashboard.yaml），查询级观测，:3238。
+  # 与 Ray Dashboard 的 :8265 不是一个东西。
+  #
+  # 只有跑在 head 上的 Ray Job driver 需要它，Daft 会通过 runtime_env
+  # 转发给 scheduler actor 和 worker actor。放这里是为了不依赖那条传播链。
+  #
+  # 必须是集群可路由的名字：localhost 会解析到每个 actor 自己的 Pod。
+  # 不需要就删掉这个 key —— Daft 只打 warning 并丢事件，作业照常跑完。
+  #
+  # envFrom 只在建 Pod 时注入；改了这里必须重建 Ray Pod。
+  # RayJob 形态下每次都是新集群，所以下一次 apply 自然生效。
+  DAFT_DASHBOARD_URL: "http://daft-dashboard.daft-bench.svc:3238"
+  # RayJob 的 head Service 名是 <rayjob>-<random>-head-svc，无法预先写死，
+  # 所以这里不再列 daft-audio-head-svc，由 .svc / .svc.cluster.local 覆盖。
+  NO_PROXY: "minio,mock-llm,daft-dashboard,.svc,.svc.cluster.local,127.0.0.1,localhost,10.0.0.0/8"
+  no_proxy: "minio,mock-llm,daft-dashboard,.svc,.svc.cluster.local,127.0.0.1,localhost,10.0.0.0/8"
+  # 每个 morsel 的行数。每行都带音频字节，默认 131072 行在这里是灾难。
+  #
+  # 重要：Daft 原生不读这个环境变量（DaftExecutionConfig::from_env 的白名单里
+  # 只有 DAFT_SHUFFLE_ALGORITHM / DAFT_SCANTASK_MAX_PARALLEL /
+  # DAFT_NATIVE_PARQUET_WRITER / DAFT_MIN_CPU_PER_TASK /
+  # DAFT_ACTOR_UDF_READY_TIMEOUT / DAFT_MAINTAIN_ORDER 和四个 inflation factor）。
+  # 它之所以生效，是因为 benchmark/audio/pipeline.py 经 config.py 读出来，
+  # 显式传给 daft.set_execution_config(default_morsel_size=...)。
+  # 新增 Daft 执行参数时必须照这条路走，否则就是死配置。
+  DAFT_DEFAULT_MORSEL_SIZE: "8"
+  # 仅在内存极紧、且明确接受内核 OOM / swap 风险时打开：关掉 Ray 的 OOM killer。
+  # RAY_memory_monitor_refresh_ms: "0"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bench-scripts
+  namespace: daft-bench
+data:
+  # --------------------------------------------------------------------------
+  # 依赖探针。RayJob 形态只探 KubeRay 不知道的那部分依赖。
+  #
+  # 原版还探 ray（head 6379）和 dashboard（head 8265），在 RayJob 下都要去掉：
+  #   - KubeRay 在提交 Ray job 前已经等 RayCluster ready
+  #   - head Service 名带随机后缀，写死的名字永远探不到
+  # --------------------------------------------------------------------------
+  wait.py: |
+    import sys, time, urllib.request
+
+    def http_ok(url):
+        try:
+            with urllib.request.urlopen(url, timeout=3) as r:
+                return 200 <= r.status < 500
+        except Exception:
+            return False
+
+    checks = {
+        "minio": lambda: http_ok("http://minio:9000/minio/health/live"),
+        "mock": lambda: http_ok("http://mock-llm:8010/health"),
+    }
+    want = sys.argv[1:] or list(checks)
+    while True:
+        pending = [n for n in want if not checks[n]()]
+        if not pending:
+            break
+        print("waiting for:", pending, flush=True)
+        time.sleep(3)
+    print("dependencies ready:", want, flush=True)
+  # --------------------------------------------------------------------------
+  # RayJob 的入口脚本，挂在 head 上（driver 就跑在 head）。
+  #
+  # 为什么必须有它：`benchmark.audio run --run-dir` 只写本地目录
+  # （benchmark/audio/config.py），而 shutdownAfterJobFinishes 会删掉持有
+  # 这个目录的 head Pod。所以产物必须在 driver 退出前推到 MinIO。
+  #
+  # 这就是原版 RayCluster + submit Job 改造成 RayJob 时唯一真正新增的东西。
+  #
+  # ConfigMap 的 key 没有执行权限，必须用 `/bin/bash /scripts/run-bench.sh` 调。
+  #
+  # 用法：run-bench.sh <DATA_RUN_ID> <RUN_ID|auto> [其余 run 参数...]
+  # 调优参数留在 RayJob 清单里，和它对应的集群规格放在一起；
+  # 这个脚本只负责 run-id / URI 接线和产物上传。
+  # --------------------------------------------------------------------------
+  run-bench.sh: |
+    # 故意不用 set -e：benchmark 失败时也必须执行下面的上传，
+    # 因为失败那次的 report 和 resources.csv 就是全部诊断依据。
+    set -uo pipefail
+
+    DATA_RUN_ID="${1:-}"
+    RUN_ID="${2:-auto}"
+    # 逐个 shift：调用方省略 RUN_ID 时，`shift 2` 会失败并把 DATA_RUN_ID 留在 "$@"
+    [ "$#" -ge 1 ] && shift
+    [ "$#" -ge 1 ] && shift
+
+    if [ -z "$DATA_RUN_ID" ] || [ "$DATA_RUN_ID" = "auto" ]; then
+      echo "DATA_RUN_ID is required as arg 1." >&2
+      echo "Apply 10-generate-job.yaml first, then use its GEN_RUN_ID." >&2
+      exit 2
+    fi
+    if [ "$RUN_ID" = "auto" ]; then
+      RUN_ID="bench-$(date -u +%Y%m%dT%H%M%SZ)"
+    fi
+
+    PREFIX="s3://benchmark/audio"
+    RUN_DIR="/out/$RUN_ID"
+    ARTIFACTS_URI="$PREFIX/$RUN_ID/artifacts"
+
+    echo "=== RUN_ID=$RUN_ID DATA_RUN_ID=$DATA_RUN_ID ==="
+    echo "=== artifacts -> $ARTIFACTS_URI ==="
+    echo "=== dashboard: ${DAFT_DASHBOARD_URL:-(unset - reporting disabled)} ==="
+
+    # 绝对 venv 路径 + cd /app：只有工作目录在 /app，benchmark 包才在 sys.path 上。
+    # Ray 的工作目录不一定是镜像 WORKDIR。
+    cd /app || exit 1
+    /opt/venv/bin/python -m benchmark.audio run \
+      --run-id "$RUN_ID" \
+      --manifest "$PREFIX/$DATA_RUN_ID/manifest.parquet" \
+      --lance-uri "$PREFIX/$RUN_ID/output.lance" \
+      --run-dir "$RUN_DIR" \
+      "$@"
+    rc=$?
+    echo "=== benchmark exit code: $rc ==="
+
+    if ! /opt/venv/bin/python /scripts/publish-artifacts.py "$RUN_DIR" "$ARTIFACTS_URI"; then
+      echo "WARNING: publishing artifacts failed. $RUN_DIR lives only on the head" >&2
+      echo "WARNING: Pod, which shutdownAfterJobFinishes will delete." >&2
+      # 上传失败不能掩盖成功的 run，但也不能静默：让 Ray job 失败，operator 才会注意到。
+      [ "$rc" -eq 0 ] && rc=1
+    fi
+
+    echo "=== report: $ARTIFACTS_URI/report.md ==="
+    echo "=== lance:  $PREFIX/$RUN_ID/output.lance ==="
+    exit "$rc"
+  # --------------------------------------------------------------------------
+  # 把跑完的 run 目录复制到 S3。复用 benchmark.audio.storage，
+  # 所以 endpoint / 凭证与流水线本身同源（MINIO_ENDPOINT、MINIO_ROOT_USER、
+  # MINIO_ROOT_PASSWORD、MINIO_REGION）。
+  # --------------------------------------------------------------------------
+  publish-artifacts.py: |
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, "/app")
+
+    from benchmark.audio.storage import (
+        ensure_bucket,
+        s3_filesystem,
+        split_s3_uri,
+        upload_file,
+    )
+
+
+    def main() -> int:
+        if len(sys.argv) != 3:
+            print("usage: publish-artifacts.py <run-dir> <s3-uri>", file=sys.stderr)
+            return 2
+        run_dir = Path(sys.argv[1])
+        dest = sys.argv[2].rstrip("/")
+        if not run_dir.is_dir():
+            print(f"nothing to publish: {run_dir} is not a directory", file=sys.stderr)
+            return 1
+
+        bucket, _ = split_s3_uri(dest)
+        fs = s3_filesystem()
+        ensure_bucket(fs, bucket)
+
+        files = 0
+        total = 0
+        for src in sorted(p for p in run_dir.rglob("*") if p.is_file()):
+            rel = src.relative_to(run_dir).as_posix()
+            total += upload_file(fs, src, f"{dest}/{rel}")
+            files += 1
+            print(f"published {rel}", flush=True)
+
+        if files == 0:
+            print(f"nothing to publish: {run_dir} is empty", file=sys.stderr)
+            return 1
+        print(f"=== published {files} files, {total} bytes -> {dest} ===", flush=True)
+        return 0
+
+
+    if __name__ == "__main__":
+        raise SystemExit(main())
+# ============================================================================
+# MinIO（节点本地 hostPath）
+# 离线导入后把 image 钉到具体 tag，例如
+#   registry.local/minio:RELEASE.2025-09-07T16-13-09Z
+# ============================================================================
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: daft-bench
+  labels: { app: minio }
+spec:
+  replicas: 1
+  # 单实例单卷：绝不能同时跑两个 Pod 写同一份数据。
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: minio }
+  template:
+    metadata:
+      labels: { app: minio }
+    spec:
+      # 必填：把 MinIO 钉到 /data 大盘所在节点。hostPath 是节点本地数据，
+      # 不能静默漂到别的节点。
+      nodeSelector:
+        kubernetes.io/hostname: REPLACE_WITH_NODE_NAME
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+      # imagePullSecrets:
+      #   - name: offline-registry
+      containers:
+        - name: minio
+          image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+          imagePullPolicy: IfNotPresent
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom: { secretKeyRef: { name: minio-creds, key: MINIO_ROOT_USER } }
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom: { secretKeyRef: { name: minio-creds, key: MINIO_ROOT_PASSWORD } }
+          ports:
+            - { containerPort: 9000, name: s3 }
+            - { containerPort: 9001, name: console }
+          readinessProbe:
+            httpGet: { path: /minio/health/live, port: 9000 }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits: { cpu: "2", memory: "4Gi" }
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          hostPath:
+            path: /data/daft-bench/minio
+            # kubelet 会自动建目录，不需要手工 mkdir，也不需要 PV/PVC。
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: daft-bench
+spec:
+  selector: { app: minio }
+  ports:
+    - { name: s3, port: 9000, targetPort: 9000 }
+    - { name: console, port: 9001, targetPort: 9001 }
+# ============================================================================
+# Mock LLM
+# 镜像必须含 benchmark.audio + ray[default]
+# ============================================================================
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-llm
+  namespace: daft-bench
+  labels: { app: mock-llm }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: mock-llm }
+  template:
+    metadata:
+      labels: { app: mock-llm }
+    spec:
+      # imagePullSecrets:
+      #   - name: offline-registry
+      containers:
+        - name: mock-llm
+          image: daft-audio:offline
+          imagePullPolicy: IfNotPresent
+          # 绝对 venv 路径。登录 shell 或 PATH 重置会命中裸的 /usr/local/bin/python。
+          command: ["/opt/venv/bin/python", "-m", "benchmark.audio", "serve-mock",
+                    "--host", "0.0.0.0", "--port", "8010", "--profile", "standard"]
+          ports:
+            - { containerPort: 8010, name: http }
+          readinessProbe:
+            httpGet: { path: /health, port: 8010 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests: { cpu: "500m", memory: "512Mi" }
+            limits: { cpu: "2", memory: "2Gi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-llm
+  namespace: daft-bench
+spec:
+  selector: { app: mock-llm }
+  ports:
+    - { name: http, port: 8010, targetPort: 8010 }

@@ -1,0 +1,154 @@
+# ============================================================================
+# RayJob（clusterSelector）—— 打进常驻集群，不建新集群
+#
+# 对应官方样例 ray-job.use-existing-raycluster.yaml。
+# 和 20-rayjob.yaml 的区别只有一件事：这份没有 rayClusterSpec，
+# 而是用 clusterSelector 指到 40-raycluster.yaml 建好的 daft-audio。
+#
+#   spec.rayClusterSpec    建临时集群，跑完拆      → 20-rayjob.yaml
+#   spec.clusterSelector   用别人的常驻集群        → 这份
+#
+# 两者必须二选一。KubeRay 的校验原话：
+#   "one of RayClusterSpec or ClusterSelector must be set"
+#
+# 前置条件：
+#   - 已 apply 00-platform.yaml
+#   - 已 apply 40-raycluster.yaml，且 STATUS=ready
+#     kubectl get raycluster daft-audio -n daft-bench
+#   - 已 apply 10-generate-job.yaml，并拿到它打印的 GEN_RUN_ID
+#
+# apply 前必做：把 entrypoint 里的 REPLACE_WITH_DATA_RUN_ID 换成 GEN_RUN_ID
+#
+# 提交与观察：
+#   kubectl apply -f examples/kuberay/41-rayjob-existing.yaml
+#   kubectl get rayjob daft-audio-run-001 -n daft-bench -w
+#   kubectl logs -n daft-bench -l job-name=daft-audio-run-001 -f
+#
+# 反复调参的循环（这就是选常驻集群的理由）：
+#   1. 改下面 entrypoint 里的 actor / partition 参数
+#   2. 改 metadata.name（RayJob 是一次性对象，同名的必须先删）
+#   3. apply，集群已经热着，秒级进入 Running
+# ============================================================================
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  # 一次调参一个名字。同名 RayJob 已终态时再 apply 不会重跑，必须先删。
+  # 批量调参用 `kubectl create -f` + generateName 更省事。
+  name: daft-audio-run-001
+  namespace: daft-bench
+  labels:
+    app.kubernetes.io/name: daft-audio-bench
+    app.kubernetes.io/component: rayjob-existing
+spec:
+  # --------------------------------------------------------------------------
+  # 目标集群。key 固定是 ray.io/cluster，value 是 RayCluster 的 metadata.name。
+  # 空 value 会被校验拒掉（"cluster name in ClusterSelector should not be empty"）。
+  #
+  # 名字必须和 40-raycluster.yaml 的 metadata.name 一致。
+  # --------------------------------------------------------------------------
+  clusterSelector:
+    ray.io/cluster: daft-audio
+
+  # --------------------------------------------------------------------------
+  # 与 20-rayjob.yaml 完全一样的入口，同一个集群预算（20 个 Ray CPU）。
+  # 调参就改这里的数字。
+  #
+  # RUN_ID 传 auto，按 UTC 时间生成。常驻集群会被反复提交，
+  # 写死 RUN_ID 会让后一次覆盖前一次的 Lance 和报表 —— 那正好毁掉调参对比。
+  # --------------------------------------------------------------------------
+  entrypoint: >-
+    /bin/bash /scripts/run-bench.sh
+    REPLACE_WITH_DATA_RUN_ID
+    auto
+    --mock-url http://mock-llm:8010
+    --ray-address auto
+    --max-minutes 360
+    --num-partitions 40
+    --asr-actor-cpus 1
+    --asr-actor-concurrency 16
+    --asr-batch-size 1
+    --llm-concurrency 16
+
+  # 同 20-rayjob.yaml：镜像里的 submit.py 在 Job runtime_env 传 env_vars，
+  # 而 pipeline.py 又把同一批 key 传给 ray.init()，Ray 2.55 会判冲突。
+  # 不设 runtimeEnvYAML，让 ray.init() 独占 worker 环境变量。
+  # runtimeEnvYAML: |
+  #   env_vars: {}
+
+  # --------------------------------------------------------------------------
+  # 生命周期。clusterSelector 模式的规则和 20-rayjob.yaml 很不一样，
+  # 下面四条都是 KubeRay 的硬约束，不是风格选择。
+  # --------------------------------------------------------------------------
+  #
+  # 1. 不设 shutdownAfterJobFinishes（也不设 ttlSecondsAfterFinished）。
+  #    KubeRay 不会删别人的集群：controller 在作业进终态时先判
+  #    clusterSelector，直接 return，"we must not delete it"。
+  #    也就是说这里写 true 也不会生效 —— 是静默忽略，不是报错。
+  #    别指望它能帮你回收，常驻集群要自己
+  #      kubectl delete raycluster daft-audio -n daft-bench
+  #    另外 ttlSecondsAfterFinished > 0 要求 shutdownAfterJobFinishes=true，
+  #    两个一起省掉才合法。
+  #
+  # 2. backoffLimit 只能是 0。校验原话：
+  #      "BackoffLimit is incompatible with ClusterSelector mode"
+  #    因为作业级重试的语义是"新建一整个 RayCluster 重跑"，
+  #    而这个模式下没有集群可建。
+  backoffLimit: 0
+  #
+  # 3. suspend 不支持（"the ClusterSelector mode doesn't support the suspend
+  #    operation"）。所以这条路径不能交给 Kueue 排队调度。
+  #
+  # 4. submissionMode 不能是 SidecarMode（"ClusterSelector is not supported
+  #    in SidecarMode"）。K8sJobMode 是默认值，也是我们要的
+  #    —— 只有它支持 submitterPodTemplate。
+  submissionMode: K8sJobMode
+  submitterConfig:
+    # 只重试"提交"这个动作，默认 2。KubeRay 用固定 submission id，
+    # 重试会重连到已在跑的 Ray job，不会重跑作业。
+    backoffLimit: 2
+  # 运行中硬超时，6h。集群是热的，不含拉起时间。
+  activeDeadlineSeconds: 21600
+  # 集群已经 ready，进 Running 只差提交，10min 还没进去就是有问题
+  # （常见原因：wait-deps 卡在 MinIO / mock-llm 没起来）。
+  # 20-rayjob.yaml 给 1800s 是因为要算上拉 10 个 worker 的时间。
+  preRunningDeadlineSeconds: 600
+
+  # --------------------------------------------------------------------------
+  # 提交器 Pod。和 20-rayjob.yaml 的一致：探 MinIO 和 mock-llm。
+  #
+  # 这个模式下不用探 Ray —— KubeRay 会等 clusterSelector 指向的集群
+  # 变成 ready 才提交。
+  #
+  # 容器列表第一个就是提交器（官方："the first container is assumed to be
+  # the submitter container"），不要写它的 command。
+  # --------------------------------------------------------------------------
+  submitterPodTemplate:
+    metadata:
+      labels:
+        app: daft-audio-existing-submitter
+      annotations:
+        kubectl.kubernetes.io/default-container: ray-job-submitter
+    spec:
+      restartPolicy: Never
+      # imagePullSecrets:
+      #   - name: offline-registry
+      initContainers:
+        - name: wait-deps
+          image: daft-audio:offline
+          imagePullPolicy: IfNotPresent
+          command: ["/opt/venv/bin/python", "/scripts/wait.py", "minio", "mock"]
+          volumeMounts:
+            - { name: scripts, mountPath: /scripts }
+      containers:
+        - name: ray-job-submitter
+          image: daft-audio:offline
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits: { cpu: "1", memory: "2Gi" }
+      volumes:
+        - name: scripts
+          configMap: { name: bench-scripts }
+
+  # 没有 rayClusterSpec。集群规格在 40-raycluster.yaml 里，
+  # 改规格要去改那个文件并重建集群，这份文件管不了。

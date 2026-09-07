@@ -1,0 +1,245 @@
+# ============================================================================
+# 常驻 RayCluster（可选路径）
+#
+# 20-rayjob.yaml 是默认路径：临时集群，跑完即拆。这份文件是另一条路径 ——
+# 集群常驻，作业用 41-rayjob-existing.yaml 的 clusterSelector 打进来。
+#
+#   40-raycluster.yaml      + 41-rayjob-existing.yaml   常驻集群，反复提交
+#   20-rayjob.yaml（单文件）                            临时集群，一次性
+#
+# 两条路径抢同一批节点，**不要同时 apply**。
+#
+# 什么时候用常驻集群：
+#   - 反复调参：改 actor 并发 / morsel / partition 连着试十几轮，
+#     每轮省掉 2–5 分钟的集群拉起时间
+#   - 交互排查：作业失败后集群还在，能直接 exec 进 head 看 /tmp/ray
+#   - 严格独占节点做对比基准：Pending 是可以接受的信号，人工介入即可
+#     （所以这里保留了硬性 nodeSelector + podAntiAffinity + DoNotSchedule，
+#      20-rayjob.yaml 里那套被放宽成 ScheduleAnyway 了）
+#
+# 代价：10 × 10Gi = 100Gi 一直占着，没人跑作业也不释放。
+# 调参结束就删掉，回到 20-rayjob.yaml。
+#
+# 前置条件：
+#   - KubeRay operator + CRD ≥ v1.6.2
+#   - 已 apply 00-platform.yaml
+#   - 镜像 daft-audio:offline 可拉（Ray 2.55.1 + ray[default] + 离线模型）
+#
+# KubeRay 建的 head Service 叫 "<metadata.name>-head-svc"，这里是固定名字：
+#   daft-audio-head-svc  →  6379 (GCS) / 8265 (dashboard+Jobs) / 10001 (client)
+# 这是它相对 RayJob 临时集群的一个实际便利 —— 临时集群的名字带随机后缀，
+# 什么都写不死。改这个 RayCluster 的 name，记得同步改
+# 41-rayjob-existing.yaml 的 clusterSelector。
+#
+# 关掉了 autoscaling：基准测试要可复现。
+#
+# 官方 KubeRay 配置要点（docs.ray.io cluster/kubernetes/user-guides/config）：
+#   - KubeRay 按容器 LIMITS 上报 CPU / memory / GPU，requests 被忽略。
+#     所以 request == limit（Guaranteed）。
+#   - 宁要少量大 Pod（一节点一个）。10 × 2CPU / 10Gi 是节点能排下的规格，
+#     不要谎报 8 CPU。
+#   - rayStartParams 的值必须是字符串；CPU/GPU/memory 不要塞进
+#     rayStartParams.resources，用 num-cpus / num-gpus / memory。
+#   - 容器列表第一个必须是 Ray 容器（ray-head / ray-worker）。
+#   - head 是单点，safe-to-evict=false。
+#
+# 内存三层，别重复扣减：
+#   1. resources.limits.memory  cgroup 上限（RSS + 实际 shm 占用）
+#   2. /dev/shm                 Plasma 所在的 tmpfs
+#   3. object-store-memory      Plasma 预留（字节）。KubeRay 不会替你填，
+#                               不填则 Ray 取可用内存的约 30%
+# KubeRay 1.6.2 会自动在 /dev/shm 注入 emptyDir.medium: Memory
+# （volume 名 shared-mem，sizeLimit = memory limit），除非已挂 /dev/shm
+# 或设了 plasma-directory。不要设 plasma-directory —— 那会跳过注入，
+# 退回容器默认的 64Mi。head 用默认（4Gi）；worker 覆盖成 3Gi，
+# 给 SenseVoice 的 RSS 留出 10Gi 里的约 7Gi。
+#
+# apply 前必做：把 10 个节点打上标签，数量必须刚好
+#   for n in node-01 node-02 ... node-10; do
+#     kubectl label node "$n" daft-bench/ray-worker=true --overwrite
+#   done
+# 只打标签没打 taint：别的 Pod 只要排得下，仍然会落到这些节点上。
+# 要真正独占，自己另加 taint + tolerations。
+#
+# apply 与验收：
+#   kubectl apply -f examples/kuberay/40-raycluster.yaml
+#   kubectl get raycluster daft-audio -n daft-bench -w   # 等 STATUS=ready
+#   kubectl get pods -n daft-bench -l ray.io/cluster=daft-audio -o wide
+#
+# 确认 Ray 真的看到 20 个 CPU（head 是 0，全部来自 worker）：
+#   kubectl exec -n daft-bench -c ray-head \
+#     "$(kubectl get pod -n daft-bench -l ray.io/node-type=head \
+#         -o jsonpath='{.items[0].metadata.name}')" -- ray status
+#
+# 删除（Pod 一起走，/out 里的东西全丢）：
+#   kubectl delete raycluster daft-audio -n daft-bench
+# ============================================================================
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: daft-audio
+  namespace: daft-bench
+  labels:
+    app.kubernetes.io/name: daft-audio-bench
+    app.kubernetes.io/component: raycluster
+spec:
+  rayVersion: "2.55.1"
+  enableInTreeAutoscaling: false
+
+  headGroupSpec:
+    serviceType: ClusterIP
+    rayStartParams:
+      # 官方：把 dashboard 暴露到 Pod 外。所有值都是字符串。
+      dashboard-host: "0.0.0.0"
+      # 官方套路：让 head 不参与 Ray 调度，ASR actor 就永远不会落到
+      # 这个 2 CPU 的 GCS/Jobs Pod 上。
+      num-cpus: "0"
+      disable-usage-stats: "true"
+      # 把 Ray 内置的 Prometheus exporter 固定到稳定端口，
+      # PodMonitor / ServiceMonitor 才不用去猜随机端口。
+      metrics-export-port: "8080"
+    template:
+      metadata:
+        labels:
+          app: daft-audio-head
+        # head 是单点（GCS + Jobs API）。挡掉 Cluster Autoscaler 的合并驱逐。
+        # 没装 autoscaler 的集群上是空操作。
+        annotations:
+          cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+      spec:
+        # imagePullSecrets:
+        #   - name: offline-registry
+        containers:
+          - name: ray-head
+            image: daft-audio:offline
+            imagePullPolicy: IfNotPresent
+            ports:
+              - { containerPort: 6379, name: gcs }
+              - { containerPort: 8265, name: dashboard }
+              - { containerPort: 10001, name: client }
+              - { containerPort: 8080, name: metrics }
+            envFrom:
+              - configMapRef: { name: bench-env }
+              - secretRef: { name: minio-creds }
+            # 外部 Prometheus/Grafana 抓这个集群时，取消注释可以把图表
+            # 嵌进 Dashboard 的 Metrics 页。地址必须从 head 可达。
+            # env:
+            #   - name: RAY_PROMETHEUS_HOST
+            #     value: "http://prometheus.monitoring.svc:9090"
+            #   - name: RAY_GRAFANA_HOST
+            #     value: "http://grafana.monitoring.svc:3000"
+            resources:
+              # request == limit，让 KubeRay 上报的内存和 QoS 对得上。
+              requests: { cpu: "2", memory: "4Gi" }
+              limits: { cpu: "2", memory: "4Gi" }
+            volumeMounts:
+              # 这里不挂 /dev/shm：KubeRay 1.6.2 会注入 shared-mem（4Gi）。
+              - { name: out, mountPath: /out }
+              - { name: ray-logs, mountPath: /tmp/ray }
+              # driver 在 head 上执行 entrypoint，所以脚本得挂在这儿。
+              # 41-rayjob-existing.yaml 和手工 `ray job submit` 都会用到
+              # /scripts/run-bench.sh。
+              - { name: scripts, mountPath: /scripts }
+            # 用 Jobs API 真的能应答来把 head-svc 的 endpoint 放行，
+            # 这正是 submit 依赖的东西。liveness 交给 KubeRay（它会注入
+            # `ray health-check`）；对 dashboard 做 HTTP liveness 会因为
+            # 偶发抖动重启 head。
+            readinessProbe:
+              httpGet: { path: /api/version, port: 8265 }
+              initialDelaySeconds: 15
+              periodSeconds: 5
+              failureThreshold: 30
+        volumes:
+          # 集群常驻，所以 /out 能跨多次作业留着，可以直接
+          #   kubectl exec ... -- cat /out/<RUN_ID>/report.md
+          # 但它仍是 emptyDir：head Pod 一重启就清空。
+          # 要持久化换成 PVC，或者继续靠 run-bench.sh 推 S3（推荐）。
+          - name: out
+            emptyDir: {}
+          - name: ray-logs
+            emptyDir: {}
+          - name: scripts
+            configMap: { name: bench-scripts }
+
+  workerGroupSpecs:
+    - groupName: asr-workers
+      # KubeRay 会把 replicas 夹到 [minReplicas, maxReplicas]，三者必须一致。
+      # 关了 autoscaling 就不要把 maxReplicas 写成 100 —— 以后一开开关，
+      # 它真会去调度 100 个 worker。
+      #
+      # 容量：10 Pod × (2 CPU, 10Gi) = 20 CPU / 100Gi。
+      # 41-rayjob-existing.yaml 的 actor 参数必须按这个数配，
+      # 不是按 10×8=80。
+      replicas: 10
+      minReplicas: 10
+      maxReplicas: 10
+      rayStartParams:
+        # 必须等于 resources.limits.cpu。Ray 调度器只看这个数字，
+        # 真正约束运行的是 cgroup limit。
+        num-cpus: "2"
+        # Plasma 预留（字节）。KubeRay 不会替你填。
+        # 必须小于下面 3Gi 的 shm 覆盖值。Ray 默认（10Gi 的约 30% ≈ 3Gi）
+        # 会把 shm 顶满，一点余量都不剩。
+        # 10k clip × 约 380KiB ≈ 3.6Gi，摊到 10 个 worker 上。
+        object-store-memory: "2147483648"
+        disable-usage-stats: "true"
+        metrics-export-port: "8080"
+      template:
+        metadata:
+          labels:
+            app: daft-audio-worker
+        spec:
+          # imagePullSecrets:
+          #   - name: offline-registry
+          #
+          # 常驻集群保留硬性约束：标签池 + 反亲和 + DoNotSchedule
+          # → 一节点一个 worker，规格可复现。
+          # 排不下就 Pending，这在常驻集群里是**想要的**信号：
+          # 你会看到、会去处理，而不是让作业带着 7 个 worker 偷偷跑完，
+          # 产出一份没法和上次对比的报表。
+          #
+          # 20-rayjob.yaml 里这套被放宽了，因为 RayJob 要等集群 ready 才提交，
+          # 一个 Pod 排不下就会拖到 preRunningDeadlineSeconds 才失败。
+          nodeSelector:
+            daft-bench/ray-worker: "true"
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app: daft-audio-worker
+                  topologyKey: kubernetes.io/hostname
+          topologySpreadConstraints:
+            - maxSkew: 1
+              topologyKey: kubernetes.io/hostname
+              whenUnsatisfiable: DoNotSchedule
+              labelSelector:
+                matchLabels:
+                  app: daft-audio-worker
+          containers:
+            - name: ray-worker
+              image: daft-audio:offline
+              imagePullPolicy: IfNotPresent
+              envFrom:
+                - configMapRef: { name: bench-env }
+                - secretRef: { name: minio-creds }
+              ports:
+                # 命名端口，PodMonitor 才能按名字选。
+                - { containerPort: 8080, name: metrics }
+              resources:
+                # request == limit（Guaranteed）。cpu 必须等于 num-cpus。
+                # 官方：KubeRay 忽略 memory request，保持两者相等。
+                requests: { cpu: "2", memory: "10Gi" }
+                limits: { cpu: "2", memory: "10Gi" }
+              volumeMounts:
+                # 覆盖自动注入（否则 sizeLimit=10Gi）。
+                # 压住 shm，别让 Plasma/tmpfs 挤掉 SenseVoice 的 RSS。
+                - { name: dshm, mountPath: /dev/shm }
+                - { name: ray-logs, mountPath: /tmp/ray }
+          volumes:
+            # 实际 shm 占用是要算进 10Gi limit 的。3Gi shm = 2Gi Plasma
+            # + 1Gi 余量。sizeLimit 是上限，不是预留。
+            - name: dshm
+              emptyDir: { medium: Memory, sizeLimit: 3Gi }
+            - name: ray-logs
+              emptyDir: {}

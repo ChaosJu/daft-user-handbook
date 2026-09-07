@@ -1,0 +1,33 @@
+# ============================================================================
+# 自建镜像版示例脚本 —— 依赖已在 daft-ray-ops 镜像里，无需 uv / runtime_env pip
+#
+# 逻辑与 00-configmap-script.yaml 相同（官方 Daft K8s 示例），
+# 去掉了 PEP 723 块和 ray.init(runtime_env={"pip": ["daft"]})。
+# 配合 10-rayjob-baked*.yaml 与 examples/docker/ 构建的镜像使用。
+# ============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: daft-quickstart
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: daft-quickstart-baked-script
+  namespace: daft-quickstart
+  labels:
+    app.kubernetes.io/name: daft-quickstart-baked
+data:
+  main.py: |
+    import daft
+
+    daft.set_runner_ray()
+
+    df = daft.from_pydict({
+        "a": [3, 2, 5, 6, 1, 4],
+        "b": [True, False, False, True, True, False]
+    })
+
+    df = df.where(df["b"]).sort(df["a"])
+
+    print(df.collect())
