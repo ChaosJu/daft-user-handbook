@@ -120,6 +120,55 @@ actor 数 = min(按 GPU 能放的, 按 CPU 能放的, 按内存能放的)
 
 这个预检查用的是集群总量，不看碎片。26 核拆成 2×13 节点、`cpus=2` 时，公式给出 13，但 SPREAD 之后每节点只放得下 6 个，实际就绪 12 个。
 
+## Partition 与 actor 池
+
+`max_concurrency` 和 `into_partitions` **不能互相替代**。前者定 actor 池大小，后者定有多少个上游 task 把数据送进 embed 阶段。
+
+### 执行模型（源码）
+
+```text
+start_udf_actors(num_actors=M, scheduling_strategy=SPREAD)
+  → M 个 UDFActor 散布全集群
+
+ActorUDF：每个上游 partition 生成一个 Swordfish task，挂上 distributed_actor_pool_project
+
+task 在 worker W 上运行时：
+  get_ready_actors_by_location(整池 handles)
+  → 有 W 上的 actor？只用 local_actors（round-robin 调 encode）
+  → 没有？才退化为 remote_actors（跨节点 RPC，少见）
+```
+
+因此：
+
+- **partition 数 ≈ 同时参与 embed 的 worker 数上限**（每个 partition 一个 task，Ray 调度到某个 worker）。
+- **max_concurrency 再大**，partition=50 时也只会约 50 台 worker 有 embed 输入；其余节点 actor 空转。
+- **有效 embed 并行** ≈ `活跃 task 数 × 每 task 所在节点的本地 actor 数`，不是 `max_concurrency` 本身。
+
+### 配置分工
+
+| 调什么 | 何时 |
+|---|---|
+| `max_concurrency` + `cpus` | 单节点能放几个 actor、全集群 actor 池多大 |
+| `batch_size` | 单次模型调用的行数上限 |
+| `into_partitions`（embed **前**） | 把 Swordfish task 摊到足够多 worker；I/O 重时 ≈ 1×～2× 总 CPU |
+| `into_partitions`（写出**前**） | coalesce 文件数，与 embed 无关 |
+
+纯 Lance 读 → embed：不为 actor 刻意 repartition 也可以，但 **partition 若只有几十个，就只有几十个节点干活**——这与「embed 阶段不做重分区」不矛盾：读侧自然 task 数太少时仍要在 embed 前 `into_partitions`。
+
+### 算例
+
+2000 CPU、133 节点 × 15 CPU、`cpus=2`：
+
+```text
+max_concurrency  700～850（单节点 floor(15÷2)=7 → 集群 ~931，留余量）
+partition        embed 前 ≥ 133，建议 sweep 500 / 1000 / 2000
+                 不要设 2 × max_concurrency
+```
+
+partition=50 时：约 50 worker × ~6 本地 actor ≈ 300 路 embed，其余节点 idle——Dashboard 上常见「大量 UDFActor、CPU 却很低」。
+
+更多 partition 决策见 [Partition · @daft.cls 与 partition](04-partition.md#daftcls-与-partition两个维度)。
+
 ## UDF 的 `batch_size` 与上游 morsel
 
 `batch_size=N` 是单批上限，不是保证值。UDF 吃到的批不会大于上游 morsel：

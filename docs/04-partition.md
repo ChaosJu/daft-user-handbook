@@ -83,7 +83,9 @@ with daft.execution_config_ctx(
 
 拆分侧用的是**磁盘压缩字节**，合并侧用的是**估算内存字节**（再乘 inflation factor）。同一个 96 / 384 在两个阶段量纲不同。
 
-## 起点公式
+## 起点公式（map-only）
+
+以下公式适用于 **无 `@daft.cls` actor 的 map-only 链路**（scan → filter → project → write）。瓶颈在 `@daft.cls` embed / 推理时，见下一节——**不要用 `2 × max_concurrency` 设 partition**。
 
 ```text
 Ray 总 CPU      = worker 副本数 × 每副本 num-cpus
@@ -102,6 +104,74 @@ Ray 总 CPU      = worker 副本数 × 每副本 num-cpus
 输入文件很少或很小时，按字节自动切分切不出足够 task，必须显式 `into_partitions`，否则并行度被输入形状卡死。
 
 同时观察：CPU 是否吃满、task P50 / P95、单 worker 峰值内存、driver metadata、spill、输出小文件数。
+
+## `@daft.cls` 与 partition：两个维度
+
+`into_partitions(N)` 和 `@daft.cls(max_concurrency=M)` **管的不是同一件事**，不能互相推导。
+
+| 参数 | 管什么 |
+|---|---|
+| `into_partitions(N)` | 上游 **Swordfish task 数**——数据切几份、Ray 把活摊到几个 worker |
+| `max_concurrency` | 全集群 **actor 实例数**——模型池有多大 |
+
+### 源码行为（为何 partition 少时大量节点空闲）
+
+1. **一个 partition → 一个 embed 输入 task**（`ActorUDF` 对上游 task 一一挂 `distributed_actor_pool_project`）。
+2. **Actor 启动时 SPREAD 全集群**（`ray_actor_pool_udf.start_udf_actors`，`scheduling_strategy: SPREAD`）。
+3. **每个 task 运行时只用本机 actor**（`DistributedActorPoolProjectOperator::try_new` → `get_ready_actors_by_location`：有本地 actor 则**不用**远端）。
+
+```text
+750 actor（SPREAD 到 133 节点）+ 50 partition
+  → 约 50 个 embed task 落到 ~50 个 worker
+  → 每个 worker 只用本机 ~6 个 actor
+  → 其余 ~80 节点上的 actor 空转
+```
+
+计划层虽把整池 actor handle 传给每个 task，**执行层会裁成本地子集**——所以「整池交给每个 task」≠「每个节点都会干活」。
+
+### 怎么设
+
+**`max_concurrency`（actor 并行度）**
+
+```text
+集群上限（CPU）     = floor(总 CPU ÷ cpus)
+单节点上限          = floor(单 worker CPU ÷ cpus)
+实际就绪 actor 数   ≈ min(集群上限, Σ 各节点 floor(...))   # SPREAD 后看单节点碎片
+max_concurrency     = 上述值再留 10%～25% 给读/写/Ray
+```
+
+例：2000 CPU、133 节点 × 15 CPU、`cpus=2` → 单节点最多 7 actor，集群约 931；`max_concurrency=750` 合理，`1000` 会挤满单节点。
+
+**partition（喂数据的 task 数）**
+
+```text
+纯 embed（数据已在 Lance，读很快）  →  不必为 actor 刻意 into_partitions；partition 太少会卡节点数
+前面有 download / decode / scan    →  partition ≈ 1×～2× 总 CPU 做 sweep
+embed 前若只有几十个 partition      →  只有几十个 worker 有 embed 活——先加 partition，不是加 max_concurrency
+写出前                              →  coalesce，与计算 partition 分开
+```
+
+**不要** `partitions = 2 × max_concurrency`。
+
+```python
+TOTAL_CPU = 2000
+N_NODES = 133
+
+df = daft.read_lance("s3://bucket/ds.lance")
+df = df.into_partitions(max(N_NODES, TOTAL_CPU))   # embed 前：让 task 摊到足够多 worker
+df = df.with_column("emb", embedder.encode(col("text")))   # 并行度在 max_concurrency
+df.into_partitions(32).write_lance("s3://bucket/out/")   # 写出前 coalesce
+```
+
+### 症状 → 动作
+
+| 现象 | 原因 | 动作 |
+|---|---|---|
+| `max_concurrency` 很大，但只有几十台 CPU 高 | partition ≈ 活跃 worker 数；本地 actor 优先 | embed **前** `into_partitions` 提到 ≥ 节点数，sweep 500～2000 |
+| 全集群 actor 数够，吞吐仍低 | 有效并行 ≈ 活跃 task 数 × 每节点本地 actor | 同上；别只加 `max_concurrency` |
+| 大量节点 actor 在、无 Swordfish task | 无 partition task 落到该节点 | 加 partition，看 `explain()` 里 embed 前 task 数 |
+
+验证：`df.num_partitions()`（embed 前）、Ray Dashboard 活跃 task 数是否接近 partition 数、idle 节点是否有 UDFActor 但无对应 task。详见 [UDF · partition 与 actor](05-udf.md#partition-与-actor-池)。
 
 ## 计算 partition ≠ 写出 partition
 

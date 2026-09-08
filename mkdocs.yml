@@ -34,7 +34,7 @@ validation:
   anchors: warn
 nav:
   - 首页: index.md
-  - 0. 速查一页: 00-cheatsheet.md
+  - 0. 配置决策: 00-cheatsheet.md
   - 1. 架构: 01-architecture.md
   - 2. 执行模型: 02-execution-model.md
   - 3. KubeRay RayJob 部署: 03-deploy-kuberay.md

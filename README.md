@@ -4,7 +4,7 @@
 
 本手册不是 API 百科，写的是生产共识。官方 API 以 [docs.daft.ai](https://docs.daft.ai) 为准。
 
-**赶时间只看 [速查一页](docs/00-cheatsheet.md)**：十条铁律、为什么不能 `collect`、分区怎么用、默认值陷阱、症状对照表、上线清单，覆盖日常九成的问题。
+**赶时间只看 [配置决策](docs/00-cheatsheet.md)**：driver 出口禁区、partition 怎么定、actor 资源与并行度怎么算、批大小、写出 coalesce，每步带公式和算例，覆盖日常九成的问题。
 
 要完整读，**从 [`docs/index.md`](docs/index.md) 开始**，那里有九页导航和四条要先记住的规则。要直接在集群上跑，从 [KubeRay RayJob 部署](docs/03-deploy-kuberay.md) + [`examples/quickstart/`](examples/quickstart/) 开始。
 

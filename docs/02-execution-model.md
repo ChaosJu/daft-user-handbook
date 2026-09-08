@@ -115,6 +115,8 @@ df = df.into_batches(1_000)
 
 `into_partitions` 便宜，只做机械拆分 / 合并；`repartition` 贵，走全局 shuffle。只想改 task 数时不要用 `repartition`。partition 的完整决策表、scan 侧切分和起点公式在 [Partition](04-partition.md)。**`into_batches` 在 Ray 上还会重切 partition**，见该页。
 
+`@daft.cls` 是例外：`max_concurrency` 定 actor 池大小，**不**替代 partition；actor SPREAD 全集群但每个 task 只用本机 actor，partition 太少会导致大量节点 idle。见 [Partition · @daft.cls](04-partition.md#daftcls-与-partition两个维度) 与 [UDF · Partition 与 actor 池](05-udf.md#partition-与-actor-池)。
+
 ## 4. Morsel 与 into_batches
 
 单 task 峰值内存靠这一节。`default_morsel_size` 与 `into_batches` 共用 `MorselSizeRequirement`、单位都是行，但语义不同：
